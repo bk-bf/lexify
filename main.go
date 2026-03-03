@@ -698,6 +698,22 @@ func render(in RenderInput) {
 		fmt.Printf("  %s(no definition found — try a different form)%s\n\n", CEx, R)
 	}
 
+	// ── target-language synonyms (one section per lang that has results) ──────
+	for i, lang := range in.TargetLangs {
+		if i >= len(in.SynTargets) {
+			break
+		}
+		syns := in.SynTargets[i]
+		if len(syns) == 0 {
+			continue
+		}
+		if len(syns) > 12 {
+			syns = syns[:12]
+		}
+		fmt.Print(sectionHeader(ISyn, "SYNONYMS ("+strings.ToUpper(lang)+")"))
+		fmt.Printf("%s%s%s\n\n", CSyn, wordWrap(strings.Join(syns, " · "), dividerWidth-2, "  "), R)
+	}
+
 	// ── synonyms (source language) ────────────────────────────────────────────
 	allSyn := dedupe(in.SynSource)
 	if in.Defn != nil {
@@ -728,22 +744,6 @@ func render(in RenderInput) {
 		fmt.Print(sectionHeader(IEty, "ETYMOLOGY ("+etymLang+")"))
 		fmt.Println(wordWrap(etymText, dividerWidth-4, "  "))
 		fmt.Println()
-	}
-
-	// ── target-language synonyms (one section per lang that has results) ──────
-	for i, lang := range in.TargetLangs {
-		if i >= len(in.SynTargets) {
-			break
-		}
-		syns := in.SynTargets[i]
-		if len(syns) == 0 {
-			continue
-		}
-		if len(syns) > 12 {
-			syns = syns[:12]
-		}
-		fmt.Print(sectionHeader(ISyn, "SYNONYMS ("+strings.ToUpper(lang)+")"))
-		fmt.Printf("%s%s%s\n\n", CSyn, wordWrap(strings.Join(syns, " · "), dividerWidth-2, "  "), R)
 	}
 
 	fmt.Printf("  %sfetched in %dms%s\n", Dim, in.Elapsed.Milliseconds(), R)

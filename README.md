@@ -16,7 +16,31 @@ lexify <word> <lang> <lang> ...
 ```
 lexify serendipity
 ```
-English definition, synonyms, and etymology.
+```
+  serendipity  /ˌsɛ.ɹən.ˈdɪ.pɪ.ti/  [en]
+  ──────────────────────────────────────────────────────────────────
+
+   DEFINITION (EN)
+  noun
+  1. A combination of events which have come together by
+  chance to make a surprisingly good or wonderful outcome.
+  2. An unsought, unintended, and/or unexpected, but
+  fortunate, discovery and/or learning experience that happens
+  by accident.
+
+
+   SYNONYMS (EN)
+  chance · luck
+
+
+   ETYMOLOGY (EN)
+  From Serendip + -ity. based on the Persian story of The
+  Three Princes of Serendip, who (Walpole wrote to a friend)
+  were "always making discoveries, by accidents and sagacity,
+  of things which they were not in quest of".
+
+  ──────────────────────────────────────────────────────────────────
+```
 
 ```
 lexify serendipity fr

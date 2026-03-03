@@ -148,7 +148,7 @@ var etymTemplates = map[string]bool{
 
 // combinerTemplates produce "A + -B" or "A- + B" display text.
 var combinerTemplates = map[string]bool{
-	"suffix": true, "prefix": true, "confix": true, "compound": true, "affix": true,
+	"suffix": true, "prefix": true, "confix": true, "compound": true, "affix": true, "af": true,
 }
 
 // resolveTemplate attempts to extract a readable display string from a
@@ -260,6 +260,14 @@ func resolveTemplate(raw string) string {
 // [[link]]              → link
 // ”italic”, ”'bold”' markers removed
 func stripWikitext(text string) string {
+	// Strip HTML comments <!-- ... -->
+	text = regexp.MustCompile(`(?s)<!--.*?-->`).ReplaceAllString(text, "")
+	// Strip <ref>...</ref> and self-closing <ref ... />  (footnote citations)
+	text = regexp.MustCompile(`(?s)<ref[^>]*>.*?</ref>`).ReplaceAllString(text, "")
+	text = regexp.MustCompile(`<ref[^>]*/>`).ReplaceAllString(text, "")
+	// Strip remaining HTML tags
+	text = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(text, "")
+
 	// Resolve innermost {{ }} templates first (no nesting), repeat until stable
 	tmplRe := regexp.MustCompile(`\{\{([^{}]*)\}\}`)
 	for {
@@ -279,6 +287,12 @@ func stripWikitext(text string) string {
 	// remove '''bold''' and ''italic'' markers
 	text = strings.ReplaceAll(text, "'''", "")
 	text = strings.ReplaceAll(text, "''", "")
+	// remove wikitext list/indent markers at start of lines
+	text = regexp.MustCompile(`(?m)^[#*:;]+\s*`).ReplaceAllString(text, "")
+	// tidy up punctuation artefacts left by removed templates: ". ." "( )" ", ,"
+	text = regexp.MustCompile(`(\. ){2,}\.?`).ReplaceAllString(text, "")
+	text = regexp.MustCompile(`(, ){2,},?`).ReplaceAllString(text, "")
+	text = regexp.MustCompile(`\(\s*\)`).ReplaceAllString(text, "")
 	// tidy up spacing artefacts from removed templates
 	text = regexp.MustCompile(` {2,}`).ReplaceAllString(text, " ")
 	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
@@ -361,6 +375,101 @@ func fetchSynonyms(word string) []string {
 	return out
 }
 
+// fetchEnWiktionary fetches the English Wiktionary page once and extracts both
+// the etymology text and a synonym list in a single HTTP round-trip, replacing
+// the separate datamuse + wiktionary calls used in Phase 1.
+// Falls back to datamuse for synonyms when the Wiktionary page has no Synonyms section.
+func fetchEnWiktionary(word string) (etym string, syns []string) {
+	const base = "https://en.wiktionary.org/w/api.php"
+	var resp struct {
+		Query struct {
+			Pages map[string]struct {
+				Revisions []struct {
+					Text string `json:"*"`
+				} `json:"revisions"`
+			} `json:"pages"`
+		} `json:"query"`
+	}
+	if err := fetchJSON(base+"?action=query&titles="+url.QueryEscape(word)+"&prop=revisions&rvprop=content&format=json", &resp); err != nil {
+		return "", nil
+	}
+	var fullText string
+	for _, p := range resp.Query.Pages {
+		if len(p.Revisions) > 0 {
+			fullText = p.Revisions[0].Text
+		}
+	}
+	if fullText == "" {
+		return "", nil
+	}
+
+	const (stNone = iota; stEtym; stSyn)
+	isEtymHeading := func(h string) bool {
+		l := strings.ToLower(h)
+		return l == "etymology" || strings.HasPrefix(l, "etymology")
+	}
+	state := stNone
+	etymDone := false // stop after first non-empty paragraph (blank line ends it)
+	var etymLines, synLines []string
+	for _, line := range strings.Split(fullText, "\n") {
+		_, heading := parseWikiHeading(line)
+		if heading != "" {
+			state = stNone
+			if !etymDone && isEtymHeading(heading) {
+				state = stEtym
+			} else if synHeadingPat.MatchString(heading) {
+				state = stSyn
+			}
+			continue
+		}
+		switch state {
+		case stEtym:
+			if strings.TrimSpace(line) == "" {
+				if len(etymLines) > 0 {
+					etymDone = true
+					state = stNone // stop collecting etymology after first blank line
+				}
+			} else {
+				etymLines = append(etymLines, line)
+			}
+		case stSyn:
+			synLines = append(synLines, line)
+		}
+	}
+
+	// Process etymology
+	if len(etymLines) > 0 {
+		clean := strings.TrimSpace(stripWikitext(strings.Join(etymLines, "\n")))
+		if runes := []rune(clean); len(runes) > 700 {
+			clean = string(runes[:700])
+		}
+		etym = clean
+	}
+
+	// Extract synonym links from Wiktionary
+	if len(synLines) > 0 {
+		linkRe := regexp.MustCompile(`\[\[(?:[^\]|]+\|)?([^\]|]+)\]\]`)
+		digitSlashRe := regexp.MustCompile(`[\d/]`)
+		seen := map[string]bool{}
+		for _, m := range linkRe.FindAllStringSubmatch(strings.Join(synLines, "\n"), -1) {
+			w := strings.TrimSpace(m[1])
+			rs := []rune(w)
+			if len(rs) < 2 || len(rs) > 30 || unicode.IsUpper(rs[0]) || digitSlashRe.MatchString(w) {
+				continue
+			}
+			if !seen[w] {
+				seen[w] = true
+				syns = append(syns, w)
+			}
+			if len(syns) >= 14 {
+				break
+			}
+		}
+	}
+
+	return etym, syns
+}
+
 // parseWikiHeading returns the heading level and trimmed title for a wikitext
 // heading line (e.g. "===Etymology 1===" → 3, "Etymology 1").
 // Returns 0, "" if the line is not a heading.
@@ -437,23 +546,6 @@ func wiktionarySection(base, word string, match func(string) bool) string {
 		}
 	}
 	return strings.Join(result, "\n")
-}
-
-func fetchEtymology(word string) string {
-	raw := wiktionarySection(
-		"https://en.wiktionary.org/w/api.php", word,
-		func(line string) bool {
-			return strings.EqualFold(line, "Etymology") || strings.HasPrefix(strings.ToLower(line), "etymology")
-		},
-	)
-	if raw == "" {
-		return ""
-	}
-	clean := strings.TrimSpace(stripWikitext(raw))
-	if len(clean) > 700 {
-		clean = clean[:700]
-	}
-	return clean
 }
 
 // parseGTXSegments concatenates the translated text chunks from raw[0] of a GTX response.
@@ -849,12 +941,12 @@ func run(word string, translateLangs []string, debug bool) {
 		etym      string
 		wordTrans = make([]*Translation, len(translateLangs))
 		// per-goroutine timings — each written by exactly one goroutine, no mutex needed
-		tDefn, tSyn, tEtym time.Duration
-		tWordTrans         = make([]time.Duration, len(translateLangs))
+		tDefn, tWiki time.Duration
+		tWordTrans   = make([]time.Duration, len(translateLangs))
 	)
 
 	var wg1 sync.WaitGroup
-	wg1.Add(3 + len(translateLangs))
+	wg1.Add(2 + len(translateLangs))
 
 	go func() {
 		defer wg1.Done()
@@ -863,16 +955,11 @@ func run(word string, translateLangs []string, debug bool) {
 		tDefn = time.Since(t)
 	}()
 	go func() {
+		// Single en.wiktionary.org call extracts both etymology and EN synonyms.
 		defer wg1.Done()
 		t := time.Now()
-		synSource = fetchSynonyms(word)
-		tSyn = time.Since(t)
-	}()
-	go func() {
-		defer wg1.Done()
-		t := time.Now()
-		etym = fetchEtymology(word)
-		tEtym = time.Since(t)
+		etym, synSource = fetchEnWiktionary(word)
+		tWiki = time.Since(t)
 	}()
 	for i, lang := range translateLangs {
 		i, lang := i, lang
@@ -974,8 +1061,7 @@ func run(word string, translateLangs []string, debug bool) {
 		fetchLog = append(fetchLog,
 			fmt.Sprintf("phase 1 (parallel):"),
 			fmt.Sprintf("  definition   %dms", tDefn.Milliseconds()),
-			fmt.Sprintf("  synonyms     %dms", tSyn.Milliseconds()),
-			fmt.Sprintf("  etymology    %dms", tEtym.Milliseconds()),
+			fmt.Sprintf("  wiktionary   %dms", tWiki.Milliseconds()),
 		)
 		for i, lang := range translateLangs {
 			fetchLog = append(fetchLog, fmt.Sprintf("  trans(%s)     %dms", lang, tWordTrans[i].Milliseconds()))

@@ -78,4 +78,4 @@ cd ~/Documents/Projects/special_projects/lexify
 go build -o lexify .
 ```
 
-The `~/.local/bin/lexify` symlink points here, so the rebuilt binary is immediately live in `$PATH`.
+

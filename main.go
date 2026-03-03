@@ -24,12 +24,12 @@ const (
 	R      = "\033[0m"
 	Bold   = "\033[1m"
 	Dim    = "\033[2;37m"
-	CWord  = "\033[1;36m"  // bold cyan   — word title
-	CHead  = "\033[1;35m"  // bold mauve  — section headers
-	CPos   = "\033[33m"    // peach       — part of speech
-	CSyn   = "\033[36m"    // cyan        — synonyms
-	CTrans = "\033[1;34m"  // bold blue   — translated word
-	CEx    = "\033[37m"    // light grey  — examples / meta
+	CWord  = "\033[1;36m" // bold cyan   — word title
+	CHead  = "\033[1;35m" // bold mauve  — section headers
+	CPos   = "\033[33m"   // peach       — part of speech
+	CSyn   = "\033[36m"   // cyan        — synonyms
+	CTrans = "\033[1;34m" // bold blue   — translated word
+	CEx    = "\033[37m"   // light grey  — examples / meta
 	//lint:ignore U1000 kept for completeness
 	CErr = "\033[31m" // red — errors
 )
@@ -221,7 +221,7 @@ func resolveTemplate(raw string) string {
 // {{other templates}}   → removed
 // [[link|display]]      → display
 // [[link]]              → link
-// ''italic'', '''bold''' markers removed
+// ”italic”, ”'bold”' markers removed
 func stripWikitext(text string) string {
 	// Resolve innermost {{ }} templates first (no nesting), repeat until stable
 	tmplRe := regexp.MustCompile(`\{\{([^{}]*)\}\}`)
@@ -410,7 +410,7 @@ func fetchGTX(word, lang string) *Translation {
 		json.Unmarshal(raw[2], &detected) //nolint
 	}
 
-	if translated == "" {
+	if translated == "" || strings.EqualFold(translated, word) {
 		return nil
 	}
 	return &Translation{Word: translated, Detected: detected}
@@ -424,12 +424,16 @@ func fetchMyMemory(word, lang string) *Translation {
 		ResponseData struct {
 			TranslatedText string `json:"translatedText"`
 		} `json:"responseData"`
+		ResponseStatus int `json:"responseStatus"`
 	}
 	if err := fetchJSON(endpoint, &raw); err != nil {
 		return nil
 	}
+	if raw.ResponseStatus != 200 {
+		return nil
+	}
 	t := strings.TrimSpace(raw.ResponseData.TranslatedText)
-	if t == "" || strings.EqualFold(t, word) {
+	if t == "" || strings.EqualFold(t, word) || strings.Contains(strings.ToUpper(t), "INVALID") {
 		return nil
 	}
 	return &Translation{Word: t, Detected: "en"}
@@ -486,6 +490,7 @@ var synHeadingPat = regexp.MustCompile(
 		`مرادف` + // ar
 		`)`,
 )
+
 // English: Datamuse. Other languages: Wiktionary synonym section via action=parse.
 func fetchTargetSynonyms(word, lang string) []string {
 	if lang == "en" {
@@ -564,16 +569,17 @@ func fetchTargetSynonyms(word, lang string) []string {
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 type RenderInput struct {
-	Word            string
-	TargetLangs     []string
-	Defn            *Definition
-	SynSource       []string
-	Etym            string
-	Translations    []*Translation
-	SynTargets      [][]string
-	DefnTranslated  string
-	EtymTranslated  string
-	PrimaryLang     string
+	Word           string
+	TargetLangs    []string
+	Defn           *Definition
+	SynSource      []string
+	Etym           string
+	Translations   []*Translation
+	SynTargets     [][]string
+	DefnTranslated string
+	EtymTranslated string
+	PrimaryLang    string
+	Warnings       []string
 }
 
 func render(in RenderInput) {
@@ -608,6 +614,14 @@ func render(in RenderInput) {
 	fmt.Printf("  %s%s%s  %s%s%s  %s[%s]%s\n",
 		CWord, Bold+in.Word, R, CEx, phonetic, R, Dim, langTag, R)
 	fmt.Println(divider())
+
+	// ── warnings ─────────────────────────────────────────────────────────────
+	for _, w := range in.Warnings {
+		fmt.Printf("  %s! %s%s\n", CErr, w, R)
+	}
+	if len(in.Warnings) > 0 {
+		fmt.Println()
+	}
 
 	// ── definition ────────────────────────────────────────────────────────────
 	fmt.Print(sectionHeader(IDef, "DEFINITION ("+dispLang+")"))
@@ -790,11 +804,11 @@ func run(word string, translateLangs []string) {
 
 	// ── Phase 1: parallel source fetches + word translations ─────────────────
 	var (
-		mu          sync.Mutex
-		defn        *Definition
-		synSource   []string
-		etym        string
-		wordTrans   = make([]*Translation, len(translateLangs))
+		mu        sync.Mutex
+		defn      *Definition
+		synSource []string
+		etym      string
+		wordTrans = make([]*Translation, len(translateLangs))
 	)
 
 	var wg1 sync.WaitGroup
@@ -829,6 +843,23 @@ func run(word string, translateLangs []string) {
 		}()
 	}
 	wg1.Wait()
+
+	// ── Validate languages: drop any whose word translation fully failed ───────
+	var warnings []string
+	{
+		var validLangs []string
+		var validTrans []*Translation
+		for i, lang := range translateLangs {
+			if wordTrans[i] == nil {
+				warnings = append(warnings, fmt.Sprintf("language %q not recognised — falling back to English", lang))
+			} else {
+				validLangs = append(validLangs, lang)
+				validTrans = append(validTrans, wordTrans[i])
+			}
+		}
+		translateLangs = validLangs
+		wordTrans = validTrans
+	}
 
 	// ── Phase 2: immediately fan out — no second barrier ─────────────────────
 	// Each result spawns its own goroutine as soon as Phase 1 data is ready.
@@ -908,6 +939,7 @@ func run(word string, translateLangs []string) {
 		DefnTranslated: defnTranslated,
 		EtymTranslated: etymTranslated,
 		PrimaryLang:    primaryLang,
+		Warnings:       warnings,
 	})
 }
 

@@ -1,10 +1,7 @@
-<img src="assets/logo.png" alt="lexify"/>
-
-**word lookup: definition · synonyms · etymology · translation**
+<img src="assets/image.png" alt="lexify"/>
 
 Terminal tool that does what a dictionary, thesaurus, and translator do — all at once, in parallel, with output in the target language. No API keys. No external dependencies. Pure Go stdlib.
 
----
 
 ## Usage
 

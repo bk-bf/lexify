@@ -162,28 +162,19 @@ func resolveTemplate(raw string) string {
 	}
 	name := strings.ToLower(strings.TrimSpace(parts[0]))
 
-	if mentionTemplates[name] {
-		// {{m|lang|word|gloss?}} — word is parts[2]
-		if len(parts) >= 3 {
-			if w := strings.TrimSpace(parts[2]); w != "" {
+	if mentionTemplates[name] || etymTemplates[name] {
+		// mention: word at parts[2]; etym (der/inh/bor…): word at parts[3]
+		idx := 2
+		if etymTemplates[name] {
+			idx = 3
+		}
+		if len(parts) > idx {
+			if w := strings.TrimSpace(parts[idx]); w != "" {
 				return w
 			}
 		}
-		if len(parts) >= 4 {
-			return strings.TrimSpace(parts[3])
-		}
-		return ""
-	}
-
-	if etymTemplates[name] {
-		// {{der|dest|src|word|gloss?}} — word is parts[3], gloss parts[4]
-		if len(parts) >= 4 {
-			if w := strings.TrimSpace(parts[3]); w != "" {
-				return w
-			}
-		}
-		if len(parts) >= 5 {
-			return strings.TrimSpace(parts[4])
+		if len(parts) > idx+1 {
+			return strings.TrimSpace(parts[idx+1])
 		}
 		return ""
 	}
@@ -347,11 +338,9 @@ func fetchSynonyms(word string) []string {
 	return out
 }
 
-// fetchEtymology uses the stable action=parse two-step API:
-// 1. Get section list, find "Etymology" index.
-// 2. Fetch that section's wikitext and strip markup.
-func fetchEtymology(word string) string {
-	// Step 1: section index
+// wiktionarySection fetches the raw wikitext of the first section in a
+// Wiktionary page whose title satisfies match, using the given API base URL.
+func wiktionarySection(base, word string, match func(string) bool) string {
 	var secResp struct {
 		Parse struct {
 			Sections []struct {
@@ -360,14 +349,12 @@ func fetchEtymology(word string) string {
 			} `json:"sections"`
 		} `json:"parse"`
 	}
-	secURL := "https://en.wiktionary.org/w/api.php?action=parse&page=" +
-		url.QueryEscape(word) + "&prop=sections&format=json"
-	if err := fetchJSON(secURL, &secResp); err != nil {
+	if err := fetchJSON(base+"?action=parse&page="+url.QueryEscape(word)+"&prop=sections&format=json", &secResp); err != nil {
 		return ""
 	}
 	idx := ""
 	for _, s := range secResp.Parse.Sections {
-		if strings.EqualFold(s.Line, "Etymology") || strings.HasPrefix(strings.ToLower(s.Line), "etymology") {
+		if match(s.Line) {
 			idx = s.Index
 			break
 		}
@@ -375,8 +362,6 @@ func fetchEtymology(word string) string {
 	if idx == "" {
 		return ""
 	}
-
-	// Step 2: wikitext of that section
 	var wtResp struct {
 		Parse struct {
 			Wikitext struct {
@@ -384,13 +369,23 @@ func fetchEtymology(word string) string {
 			} `json:"wikitext"`
 		} `json:"parse"`
 	}
-	wtURL := "https://en.wiktionary.org/w/api.php?action=parse&page=" +
-		url.QueryEscape(word) + "&prop=wikitext&section=" + idx + "&format=json"
-	if err := fetchJSON(wtURL, &wtResp); err != nil {
+	if err := fetchJSON(base+"?action=parse&page="+url.QueryEscape(word)+"&prop=wikitext&section="+idx+"&format=json", &wtResp); err != nil {
 		return ""
 	}
-	clean := stripWikitext(wtResp.Parse.Wikitext.Text)
-	// Drop the section heading line itself (===Etymology===)
+	return wtResp.Parse.Wikitext.Text
+}
+
+func fetchEtymology(word string) string {
+	raw := wiktionarySection(
+		"https://en.wiktionary.org/w/api.php", word,
+		func(line string) bool {
+			return strings.EqualFold(line, "Etymology") || strings.HasPrefix(strings.ToLower(line), "etymology")
+		},
+	)
+	if raw == "" {
+		return ""
+	}
+	clean := stripWikitext(raw)
 	if i := strings.Index(clean, "\n"); i != -1 {
 		clean = strings.TrimSpace(clean[i+1:])
 	}
@@ -400,39 +395,34 @@ func fetchEtymology(word string) string {
 	return clean
 }
 
-// fetchGTX hits the undocumented Google Translate gtx endpoint.
-// Response is a heterogeneous JSON array; we unmarshal to []json.RawMessage.
-func fetchGTX(word, lang string) *Translation {
-	endpoint := "https://translate.google.com/translate_a/single" +
-		"?client=gtx&sl=auto&tl=" + url.QueryEscape(lang) +
-		"&dt=t&dt=bd&q=" + url.QueryEscape(word)
-
-	var raw []json.RawMessage
-	if err := fetchJSON(endpoint, &raw); err != nil || len(raw) == 0 {
-		return nil
-	}
-
-	// data[0]: [[translated_chunk, original, ...], ...]
-	var segments [][]json.RawMessage
-	translated := ""
-	if err := json.Unmarshal(raw[0], &segments); err == nil {
-		for _, seg := range segments {
+// parseGTXSegments concatenates the translated text chunks from raw[0] of a GTX response.
+func parseGTXSegments(raw []json.RawMessage) string {
+	var segs [][]json.RawMessage
+	var sb strings.Builder
+	if json.Unmarshal(raw[0], &segs) == nil {
+		for _, seg := range segs {
 			if len(seg) > 0 {
 				var s string
 				if json.Unmarshal(seg[0], &s) == nil {
-					translated += s
+					sb.WriteString(s)
 				}
 			}
 		}
 	}
-	translated = strings.TrimSpace(translated)
+	return strings.TrimSpace(sb.String())
+}
 
-	// data[2]: detected language string
+// fetchGTX hits the undocumented Google Translate gtx endpoint.
+func fetchGTX(word, lang string) *Translation {
+	var raw []json.RawMessage
+	if err := fetchJSON("https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl="+url.QueryEscape(lang)+"&dt=t&dt=bd&q="+url.QueryEscape(word), &raw); err != nil || len(raw) == 0 {
+		return nil
+	}
+	translated := parseGTXSegments(raw)
 	detected := "?"
 	if len(raw) > 2 {
 		json.Unmarshal(raw[2], &detected) //nolint
 	}
-
 	if translated == "" || strings.EqualFold(translated, word) {
 		return nil
 	}
@@ -477,26 +467,11 @@ func fetchTextTranslation(text, lang string) string {
 	if text == "" || lang == "" || strings.ToLower(lang) == "en" {
 		return ""
 	}
-	endpoint := "https://translate.google.com/translate_a/single" +
-		"?client=gtx&sl=auto&tl=" + url.QueryEscape(lang) +
-		"&dt=t&q=" + url.QueryEscape(text)
 	var raw []json.RawMessage
-	if err := fetchJSON(endpoint, &raw); err != nil || len(raw) == 0 {
+	if err := fetchJSON("https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl="+url.QueryEscape(lang)+"&dt=t&q="+url.QueryEscape(text), &raw); err != nil || len(raw) == 0 {
 		return ""
 	}
-	var segments [][]json.RawMessage
-	out := ""
-	if err := json.Unmarshal(raw[0], &segments); err == nil {
-		for _, seg := range segments {
-			if len(seg) > 0 {
-				var s string
-				if json.Unmarshal(seg[0], &s) == nil {
-					out += s
-				}
-			}
-		}
-	}
-	return strings.TrimSpace(out)
+	return parseGTXSegments(raw)
 }
 
 // synHeadingPat matches the "Synonyms" section heading across major Wiktionary languages.
@@ -520,48 +495,17 @@ func fetchTargetSynonyms(word, lang string) []string {
 		return fetchSynonyms(word)
 	}
 
-	// Find synonym section index in target-language Wiktionary
-	var secResp struct {
-		Parse struct {
-			Sections []struct {
-				Line  string `json:"line"`
-				Index string `json:"index"`
-			} `json:"sections"`
-		} `json:"parse"`
-	}
-	wikiBase := "https://" + lang + ".wiktionary.org/w/api.php"
-	secURL := wikiBase + "?action=parse&page=" + url.QueryEscape(word) + "&prop=sections&format=json"
-	if err := fetchJSON(secURL, &secResp); err != nil {
-		return nil
-	}
-
-	synIdx := ""
-	for _, s := range secResp.Parse.Sections {
-		if synHeadingPat.MatchString(s.Line) {
-			synIdx = s.Index
-			break
-		}
-	}
-	if synIdx == "" {
-		return nil
-	}
-
-	var wtResp struct {
-		Parse struct {
-			Wikitext struct {
-				Text string `json:"*"`
-			} `json:"wikitext"`
-		} `json:"parse"`
-	}
-	wtURL := wikiBase + "?action=parse&page=" + url.QueryEscape(word) +
-		"&prop=wikitext&section=" + synIdx + "&format=json"
-	if err := fetchJSON(wtURL, &wtResp); err != nil {
+	wt := wiktionarySection(
+		"https://"+lang+".wiktionary.org/w/api.php", word,
+		func(line string) bool { return synHeadingPat.MatchString(line) },
+	)
+	if wt == "" {
 		return nil
 	}
 
 	// Extract [[word]] or [[word|display]] from wikitext — these are the synonyms
 	linkRe := regexp.MustCompile(`\[\[(?:[^\]|]+\|)?([^\]|]+)\]\]`)
-	matches := linkRe.FindAllStringSubmatch(wtResp.Parse.Wikitext.Text, -1)
+	matches := linkRe.FindAllStringSubmatch(wt, -1)
 
 	digitSlashRe := regexp.MustCompile(`[\d/]`)
 	seen := map[string]bool{}
@@ -830,7 +774,6 @@ func run(word string, translateLangs []string) {
 
 	// ── Phase 1: parallel source fetches + word translations ─────────────────
 	var (
-		mu        sync.Mutex
 		defn      *Definition
 		synSource []string
 		etym      string
@@ -846,26 +789,17 @@ func run(word string, translateLangs []string) {
 	}()
 	go func() {
 		defer wg1.Done()
-		s := fetchSynonyms(word)
-		mu.Lock()
-		synSource = s
-		mu.Unlock()
+		synSource = fetchSynonyms(word)
 	}()
 	go func() {
 		defer wg1.Done()
-		e := fetchEtymology(word)
-		mu.Lock()
-		etym = e
-		mu.Unlock()
+		etym = fetchEtymology(word)
 	}()
 	for i, lang := range translateLangs {
 		i, lang := i, lang
 		go func() {
 			defer wg1.Done()
-			t := fetchTranslation(word, lang)
-			mu.Lock()
-			wordTrans[i] = t
-			mu.Unlock()
+			wordTrans[i] = fetchTranslation(word, lang)
 		}()
 	}
 	wg1.Wait()
@@ -924,29 +858,20 @@ func run(word string, translateLangs []string) {
 		go func() {
 			defer wg2.Done()
 			if wordTrans[i] != nil && wordTrans[i].Word != "" {
-				s := fetchTargetSynonyms(wordTrans[i].Word, lang)
-				mu.Lock()
-				synTargets[i] = s
-				mu.Unlock()
+				synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
 			}
 		}()
 	}
 	go func() {
 		defer wg2.Done()
 		if primaryLang != "" && defBlock != "" {
-			t := fetchTextTranslation(defBlock, primaryLang)
-			mu.Lock()
-			defnTranslated = t
-			mu.Unlock()
+			defnTranslated = fetchTextTranslation(defBlock, primaryLang)
 		}
 	}()
 	go func() {
 		defer wg2.Done()
 		if primaryLang != "" && etym != "" {
-			t := fetchTextTranslation(etym, primaryLang)
-			mu.Lock()
-			etymTranslated = t
-			mu.Unlock()
+			etymTranslated = fetchTextTranslation(etym, primaryLang)
 		}
 	}()
 	wg2.Wait()

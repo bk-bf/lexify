@@ -14,8 +14,10 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
+	"unsafe"
 )
 
 // ── ANSI constants ────────────────────────────────────────────────────────────
@@ -34,7 +36,28 @@ const (
 	CErr = "\033[31m" // red — errors
 )
 
-const dividerWidth = 66
+// winsize mirrors the kernel struct winsize used by TIOCGWINSZ.
+type winsize struct{ Row, Col, Xpixel, Ypixel uint16 }
+
+// dividerWidth is computed once at startup from the real terminal column count
+// via TIOCGWINSZ ioctl. Falls back to 76 when stdout is not a TTY.
+var dividerWidth = func() int {
+	var ws winsize
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_IOCTL,
+		uintptr(1), // stdout fd
+		uintptr(syscall.TIOCGWINSZ),
+		uintptr(unsafe.Pointer(&ws)),
+	)
+	if errno == 0 && ws.Col > 0 {
+		w := int(ws.Col) - 4 // 2-space left margin + 2-char right breathing room
+		if w < 40 {
+			w = 40
+		}
+		return w
+	}
+	return 76 // fallback: 80-col terminal
+}()
 
 // Nerd Font icons (nf-fa, reliable in SauceCodePro NF)
 const (
@@ -634,9 +657,9 @@ func render(in RenderInput) {
 			lines := strings.SplitN(para, "\n", 2)
 			if len(lines) == 2 {
 				fmt.Printf("  %s%s%s\n", CPos+Bold, strings.TrimSuffix(lines[0], ":"), R)
-				fmt.Println(wordWrap(strings.TrimSpace(lines[1]), 62, "  "))
+				fmt.Println(wordWrap(strings.TrimSpace(lines[1]), dividerWidth-4, "  "))
 			} else {
-				fmt.Println(wordWrap(para, 62, "  "))
+				fmt.Println(wordWrap(para, dividerWidth-4, "  "))
 			}
 			fmt.Println()
 		}
@@ -644,7 +667,7 @@ func render(in RenderInput) {
 		for _, m := range in.Defn.Meanings {
 			fmt.Printf("  %s%s%s\n", CPos+Bold, m.POS, R)
 			for i, d := range m.Defs {
-				fmt.Println(wordWrap(fmt.Sprintf("%d. %s", i+1, d.Text), 62, "  "))
+				fmt.Println(wordWrap(fmt.Sprintf("%d. %s", i+1, d.Text), dividerWidth-4, "  "))
 				if d.Example != "" {
 					fmt.Printf("  %s\"%s\"%s\n", CEx, d.Example, R)
 				}
@@ -671,7 +694,7 @@ func render(in RenderInput) {
 	}
 	if len(allSyn) > 0 {
 		fmt.Print(sectionHeader(ISyn, "SYNONYMS ("+srcLang+")"))
-		fmt.Printf("%s%s%s\n\n", CSyn, wordWrap(strings.Join(allSyn, " · "), 64, "  "), R)
+		fmt.Printf("%s%s%s\n\n", CSyn, wordWrap(strings.Join(allSyn, " · "), dividerWidth-2, "  "), R)
 	}
 
 	// ── etymology ─────────────────────────────────────────────────────────────
@@ -683,7 +706,7 @@ func render(in RenderInput) {
 	}
 	if etymText != "" {
 		fmt.Print(sectionHeader(IEty, "ETYMOLOGY ("+etymLang+")"))
-		fmt.Println(wordWrap(etymText, 62, "  "))
+		fmt.Println(wordWrap(etymText, dividerWidth-4, "  "))
 		fmt.Println()
 	}
 
@@ -700,7 +723,7 @@ func render(in RenderInput) {
 			syns = syns[:12]
 		}
 		fmt.Print(sectionHeader(ISyn, "SYNONYMS ("+strings.ToUpper(lang)+")"))
-		fmt.Printf("%s%s%s\n\n", CSyn, wordWrap(strings.Join(syns, " · "), 64, "  "), R)
+		fmt.Printf("%s%s%s\n\n", CSyn, wordWrap(strings.Join(syns, " · "), dividerWidth-2, "  "), R)
 	}
 
 	// ── translations ──────────────────────────────────────────────────────────
@@ -757,21 +780,24 @@ func printHelp() {
 	}
 
 	fmt.Printf("  %s%sLANGUAGES%s\n", CHead, Bold, R)
-	fmt.Printf("  %sPass any BCP-47 code: fr  ru  de  es  it  pt  ja  zh  ko  ar  nl  pl  sv  tr  uk  hi  …%s\n\n", CEx, R)
+	fmt.Println(wordWrap("Pass any BCP-47 code: fr  ru  de  es  it  pt  ja  zh  ko  ar  nl  pl  sv  tr  uk  hi  …", dividerWidth-4, "  "))
+	fmt.Println()
 
 	fmt.Printf("  %s%sDATA SOURCES%s\n", CHead, Bold, R)
 	sources := [][2]string{
-		{IDef + " Definition ", "dictionaryapi.dev     (English source words)"},
-		{ISyn + " Synonyms   ", "datamuse.com          (EN) · Wiktionary (other langs)"},
-		{IEty + " Etymology  ", "en.wiktionary.org     (action=parse, wikitext)"},
-		{ITrans + " Translation", "Google Translate gtx  · MyMemory fallback (no key)"},
+		{IDef + "Definition", "dictionaryapi.dev  (English source words)"},
+		{ISyn + "Synonyms", "datamuse.com  (EN) · Wiktionary (other langs)"},
+		{IEty + "Etymology", "en.wiktionary.org  (action=parse, wikitext)"},
+		{ITrans + "Translation", "Google Translate gtx  · MyMemory fallback (no key)"},
 	}
 	for _, s := range sources {
-		fmt.Printf("  %s%s%s%-16s%s  %s%s%s\n", CHead, Bold, s[0], "", R, CEx, s[1], R)
+		fmt.Printf("  %s%s%s%s\n", CHead, Bold, s[0], R)
+		fmt.Println(wordWrap(s[1], dividerWidth-4, "    "))
+		fmt.Println()
 	}
-	fmt.Println()
 	fmt.Println(divider())
-	fmt.Printf("  %sall requests fire in parallel · no API keys · no local deps%s\n\n", CEx, R)
+	fmt.Println(wordWrap("all requests fire in parallel · no API keys · no local deps", dividerWidth-4, "  "))
+	fmt.Println()
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-<img src="assets/logo.svg" alt="lexify"/>
+<img src="assets/logo.png" alt="lexify"/>
 
 **word lookup: definition · synonyms · etymology · translation**
 

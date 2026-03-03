@@ -135,6 +135,7 @@ func sectionHeader(icon, title string) string {
 // mentionTemplates: structure is {{name|lang|word|gloss?}} — word is parts[2]
 var mentionTemplates = map[string]bool{
 	"m": true, "l": true, "m+": true, "mention": true, "link": true,
+	"cog": true, "noncog": true, "ncog": true, // cognate — same shape as mention
 }
 
 // etymTemplates: structure is {{name|dest|src|word|gloss?}} — word is parts[3]
@@ -142,7 +143,6 @@ var etymTemplates = map[string]bool{
 	"inh": true, "inh+": true,
 	"bor": true, "bor+": true,
 	"der": true, "der+": true,
-	"cog": true, "noncog": true,
 	"inherited": true, "borrowed": true, "derived": true,
 }
 
@@ -163,20 +163,43 @@ func resolveTemplate(raw string) string {
 	name := strings.ToLower(strings.TrimSpace(parts[0]))
 
 	if mentionTemplates[name] || etymTemplates[name] {
-		// mention: word at parts[2]; etym (der/inh/bor…): word at parts[3]
+		// mention/cog: word at parts[2]; etym (der/inh/bor…): word at parts[3]
 		idx := 2
 		if etymTemplates[name] {
 			idx = 3
 		}
-		if len(parts) > idx {
-			if w := strings.TrimSpace(parts[idx]); w != "" {
-				return w
+		// Collect positional args and tr= transliteration
+		word := ""
+		tr := ""
+		for i, p := range parts[1:] {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "tr=") {
+				tr = strings.TrimPrefix(p, "tr=")
+			} else if strings.HasPrefix(p, "t=") || strings.HasPrefix(p, "gloss=") || strings.Contains(p, "=") {
+				continue
+			} else if i+1 == idx { // i+1 because parts[1:] drops name
+				word = p
 			}
 		}
-		if len(parts) > idx+1 {
-			return strings.TrimSpace(parts[idx+1])
+		if word != "" {
+			return word
+		}
+		if tr != "" {
+			return tr
 		}
 		return ""
+	}
+
+	// {{doublet|lang|word1|word2|...}} — list all words
+	if name == "doublet" {
+		var words []string
+		for _, p := range parts[2:] {
+			p = strings.TrimSpace(p)
+			if p != "" && !strings.Contains(p, "=") {
+				words = append(words, p)
+			}
+		}
+		return strings.Join(words, ", ")
 	}
 
 	if combinerTemplates[name] {
@@ -338,41 +361,82 @@ func fetchSynonyms(word string) []string {
 	return out
 }
 
-// wiktionarySection fetches the raw wikitext of the first section in a
-// Wiktionary page whose title satisfies match, using the given API base URL.
-func wiktionarySection(base, word string, match func(string) bool) string {
-	var secResp struct {
-		Parse struct {
-			Sections []struct {
-				Line  string `json:"line"`
-				Index string `json:"index"`
-			} `json:"sections"`
-		} `json:"parse"`
+// parseWikiHeading returns the heading level and trimmed title for a wikitext
+// heading line (e.g. "===Etymology 1===" → 3, "Etymology 1").
+// Returns 0, "" if the line is not a heading.
+func parseWikiHeading(line string) (int, string) {
+	line = strings.TrimRight(line, " \t")
+	if len(line) < 4 || line[0] != '=' {
+		return 0, ""
 	}
-	if err := fetchJSON(base+"?action=parse&page="+url.QueryEscape(word)+"&prop=sections&format=json", &secResp); err != nil {
+	open := 0
+	for open < len(line) && line[open] == '=' {
+		open++
+	}
+	if open < 2 || open > 4 {
+		return 0, ""
+	}
+	close := 0
+	for close < len(line) && line[len(line)-1-close] == '=' {
+		close++
+	}
+	if close != open {
+		return 0, ""
+	}
+	inner := strings.TrimSpace(line[open : len(line)-close])
+	if inner == "" {
+		return 0, ""
+	}
+	return open, inner
+}
+
+// wiktionarySection fetches the full page wikitext in a single API call and
+// extracts the first section whose heading satisfies match.
+// This avoids the two-round-trip sections-index → wikitext pattern.
+func wiktionarySection(base, word string, match func(string) bool) string {
+	var resp struct {
+		Query struct {
+			Pages map[string]struct {
+				Revisions []struct {
+					Text string `json:"*"`
+				} `json:"revisions"`
+			} `json:"pages"`
+		} `json:"query"`
+	}
+	if err := fetchJSON(base+"?action=query&titles="+url.QueryEscape(word)+"&prop=revisions&rvprop=content&format=json", &resp); err != nil {
 		return ""
 	}
-	idx := ""
-	for _, s := range secResp.Parse.Sections {
-		if match(s.Line) {
-			idx = s.Index
-			break
+	var fullText string
+	for _, p := range resp.Query.Pages {
+		if len(p.Revisions) > 0 {
+			fullText = p.Revisions[0].Text
 		}
 	}
-	if idx == "" {
+	if fullText == "" {
 		return ""
 	}
-	var wtResp struct {
-		Parse struct {
-			Wikitext struct {
-				Text string `json:"*"`
-			} `json:"wikitext"`
-		} `json:"parse"`
+
+	// Walk lines: find the heading that satisfies match, collect until next same/higher heading.
+	// We parse headings manually (count leading/trailing '=') to avoid RE2 backreference limits.
+	lines := strings.Split(fullText, "\n")
+	var result []string
+	inSection := false
+	for _, line := range lines {
+		level, heading := parseWikiHeading(line)
+		if level > 0 {
+			if inSection {
+				break // stop at any heading once inside the target section
+			}
+			if match(heading) {
+				inSection = true
+			}
+			continue
+		}
+		if inSection {
+			result = append(result, line)
+		}
 	}
-	if err := fetchJSON(base+"?action=parse&page="+url.QueryEscape(word)+"&prop=wikitext&section="+idx+"&format=json", &wtResp); err != nil {
-		return ""
-	}
-	return wtResp.Parse.Wikitext.Text
+	return strings.Join(result, "\n")
 }
 
 func fetchEtymology(word string) string {
@@ -385,10 +449,7 @@ func fetchEtymology(word string) string {
 	if raw == "" {
 		return ""
 	}
-	clean := stripWikitext(raw)
-	if i := strings.Index(clean, "\n"); i != -1 {
-		clean = strings.TrimSpace(clean[i+1:])
-	}
+	clean := strings.TrimSpace(stripWikitext(raw))
 	if len(clean) > 700 {
 		clean = clean[:700]
 	}
@@ -547,6 +608,8 @@ type RenderInput struct {
 	EtymTranslated string
 	PrimaryLang    string
 	Warnings       []string
+	Elapsed        time.Duration
+	FetchLog       []string // per-fetch timing lines
 }
 
 func render(in RenderInput) {
@@ -588,6 +651,19 @@ func render(in RenderInput) {
 	}
 	if len(in.Warnings) > 0 {
 		fmt.Println()
+	}
+
+	// ── translations ──────────────────────────────────────────────────────────
+	if len(in.Translations) > 0 {
+		fmt.Print(sectionHeader(ITrans, "TRANSLATIONS"))
+		for i, t := range in.Translations {
+			langCode := strings.ToUpper(in.TargetLangs[i])
+			if t == nil {
+				fmt.Printf("  %s%s%s  %s(translation failed)%s\n\n", CPos+Bold, langCode, R, CEx, R)
+				continue
+			}
+			fmt.Printf("  %s%s%s  %s%s%s\n\n", CPos+Bold, langCode, R, CTrans+Bold, t.Word, R)
+		}
 	}
 
 	// ── definition ────────────────────────────────────────────────────────────
@@ -670,19 +746,12 @@ func render(in RenderInput) {
 		fmt.Printf("%s%s%s\n\n", CSyn, wordWrap(strings.Join(syns, " · "), dividerWidth-2, "  "), R)
 	}
 
-	// ── translations ──────────────────────────────────────────────────────────
-	if len(in.Translations) > 0 {
-		fmt.Print(sectionHeader(ITrans, "TRANSLATIONS"))
-		for i, t := range in.Translations {
-			langCode := strings.ToUpper(in.TargetLangs[i])
-			if t == nil {
-				fmt.Printf("  %s%s%s  %s(translation failed)%s\n\n", CPos+Bold, langCode, R, CEx, R)
-				continue
-			}
-			fmt.Printf("  %s%s%s  %s%s%s\n\n", CPos+Bold, langCode, R, CTrans+Bold, t.Word, R)
+	fmt.Printf("  %sfetched in %dms%s\n", Dim, in.Elapsed.Milliseconds(), R)
+	if len(in.FetchLog) > 0 {
+		for _, line := range in.FetchLog {
+			fmt.Printf("  %s%s%s\n", Dim, line, R)
 		}
 	}
-
 	fmt.Println(divider())
 	fmt.Println()
 }
@@ -769,7 +838,8 @@ func contains(s []string, v string) bool {
 
 // ── Orchestration ─────────────────────────────────────────────────────────────
 
-func run(word string, translateLangs []string) {
+func run(word string, translateLangs []string, debug bool) {
+	start := time.Now()
 	fmt.Printf("\n  %slooking up %s%s%s%s…%s\r", CEx, Bold, word, R, CEx, R)
 
 	// ── Phase 1: parallel source fetches + word translations ─────────────────
@@ -778,6 +848,9 @@ func run(word string, translateLangs []string) {
 		synSource []string
 		etym      string
 		wordTrans = make([]*Translation, len(translateLangs))
+		// per-goroutine timings — each written by exactly one goroutine, no mutex needed
+		tDefn, tSyn, tEtym time.Duration
+		tWordTrans         = make([]time.Duration, len(translateLangs))
 	)
 
 	var wg1 sync.WaitGroup
@@ -785,21 +858,29 @@ func run(word string, translateLangs []string) {
 
 	go func() {
 		defer wg1.Done()
+		t := time.Now()
 		defn = fetchDefinition(word)
+		tDefn = time.Since(t)
 	}()
 	go func() {
 		defer wg1.Done()
+		t := time.Now()
 		synSource = fetchSynonyms(word)
+		tSyn = time.Since(t)
 	}()
 	go func() {
 		defer wg1.Done()
+		t := time.Now()
 		etym = fetchEtymology(word)
+		tEtym = time.Since(t)
 	}()
 	for i, lang := range translateLangs {
 		i, lang := i, lang
 		go func() {
 			defer wg1.Done()
+			t := time.Now()
 			wordTrans[i] = fetchTranslation(word, lang)
+			tWordTrans[i] = time.Since(t)
 		}()
 	}
 	wg1.Wait()
@@ -848,6 +929,9 @@ func run(word string, translateLangs []string) {
 		synTargets     = make([][]string, len(translateLangs))
 		defnTranslated string
 		etymTranslated string
+		tSynTargets    = make([]time.Duration, len(translateLangs))
+		tDefnTrans     time.Duration
+		tEtymTrans     time.Duration
 	)
 
 	var wg2 sync.WaitGroup
@@ -858,26 +942,57 @@ func run(word string, translateLangs []string) {
 		go func() {
 			defer wg2.Done()
 			if wordTrans[i] != nil && wordTrans[i].Word != "" {
+				t := time.Now()
 				synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
+				tSynTargets[i] = time.Since(t)
 			}
 		}()
 	}
 	go func() {
 		defer wg2.Done()
 		if primaryLang != "" && defBlock != "" {
+			t := time.Now()
 			defnTranslated = fetchTextTranslation(defBlock, primaryLang)
+			tDefnTrans = time.Since(t)
 		}
 	}()
 	go func() {
 		defer wg2.Done()
 		if primaryLang != "" && etym != "" {
+			t := time.Now()
 			etymTranslated = fetchTextTranslation(etym, primaryLang)
+			tEtymTrans = time.Since(t)
 		}
 	}()
 	wg2.Wait()
 
 	// Clear the "looking up…" line
 	fmt.Printf("\033[1A\033[2K")
+
+	var fetchLog []string
+	if debug {
+		fetchLog = append(fetchLog,
+			fmt.Sprintf("phase 1 (parallel):"),
+			fmt.Sprintf("  definition   %dms", tDefn.Milliseconds()),
+			fmt.Sprintf("  synonyms     %dms", tSyn.Milliseconds()),
+			fmt.Sprintf("  etymology    %dms", tEtym.Milliseconds()),
+		)
+		for i, lang := range translateLangs {
+			fetchLog = append(fetchLog, fmt.Sprintf("  trans(%s)     %dms", lang, tWordTrans[i].Milliseconds()))
+		}
+		fetchLog = append(fetchLog, fmt.Sprintf("phase 2 (parallel):"))
+		for i, lang := range translateLangs {
+			if tSynTargets[i] > 0 {
+				fetchLog = append(fetchLog, fmt.Sprintf("  syns(%s)      %dms", lang, tSynTargets[i].Milliseconds()))
+			}
+		}
+		if tDefnTrans > 0 {
+			fetchLog = append(fetchLog, fmt.Sprintf("  defn-trans   %dms", tDefnTrans.Milliseconds()))
+		}
+		if tEtymTrans > 0 {
+			fetchLog = append(fetchLog, fmt.Sprintf("  etym-trans   %dms", tEtymTrans.Milliseconds()))
+		}
+	}
 
 	render(RenderInput{
 		Word:           word,
@@ -891,6 +1006,8 @@ func run(word string, translateLangs []string) {
 		EtymTranslated: etymTranslated,
 		PrimaryLang:    primaryLang,
 		Warnings:       warnings,
+		Elapsed:        time.Since(start),
+		FetchLog:       fetchLog,
 	})
 }
 
@@ -902,12 +1019,17 @@ func main() {
 		return
 	}
 	word := strings.TrimSpace(os.Args[1])
+	debug := false
 	var translateLangs []string
 	for _, a := range os.Args[2:] {
+		if a == "-d" {
+			debug = true
+			continue
+		}
 		l := strings.ToLower(strings.TrimSpace(a))
 		if l != "en" {
 			translateLangs = append(translateLangs, l)
 		}
 	}
-	run(word, translateLangs)
+	run(word, translateLangs, debug)
 }

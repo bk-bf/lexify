@@ -403,7 +403,11 @@ func fetchEnWiktionary(word string) (etym string, syns []string) {
 		return "", nil
 	}
 
-	const (stNone = iota; stEtym; stSyn)
+	const (
+		stNone = iota
+		stEtym
+		stSyn
+	)
 	isEtymHeading := func(h string) bool {
 		l := strings.ToLower(h)
 		return l == "etymology" || strings.HasPrefix(l, "etymology")

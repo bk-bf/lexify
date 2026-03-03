@@ -61,6 +61,26 @@ Pass any BCP-47 code: `fr` `ru` `de` `es` `it` `pt` `ja` `zh` `ko` `ar` `nl` `pl
 
 ---
 
+## Installation
+
+**Prerequisites:** Go 1.21+
+
+```sh
+go install github.com/bk-bf/lexify@latest
+```
+
+The binary is placed in `$GOPATH/bin` (usually `~/go/bin`). Make sure that's on your `$PATH`.
+
+**Build from source:**
+
+```sh
+git clone https://github.com/bk-bf/lexify.git
+cd lexify
+go build -o lexify .
+```
+
+---
+
 ## Output
 
 Each lookup produces a formatted block with:

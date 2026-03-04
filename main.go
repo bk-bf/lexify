@@ -338,6 +338,7 @@ type Definition struct {
 type Translation struct {
 	Word     string
 	Detected string
+	Source   string // "gtx" or "mymemory"
 }
 
 // LexEntry is the value stored in each embedded data pack entry.
@@ -466,6 +467,47 @@ func lookupEN(word string) *LexEntry {
 		return nil
 	}
 	return enProvider.Lookup(word)
+}
+
+// packRegistry holds installed packs for non-EN languages.
+// Built once at startup by scanning the XDG data dir.
+var packRegistry = func() map[string]*installedPack {
+	packs := map[string]*installedPack{}
+	entries, err := os.ReadDir(xdgDataDir())
+	if err != nil {
+		return packs
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".idx") {
+			continue
+		}
+		lang := strings.TrimSuffix(name, ".idx")
+		if lang == "en" {
+			continue // handled by enProvider
+		}
+		dir := xdgDataDir()
+		idxPath := filepath.Join(dir, name)
+		datPath := filepath.Join(dir, lang+".dat")
+		if _, err := os.Stat(datPath); err != nil {
+			continue
+		}
+		p := &installedPack{idxPath: idxPath, datPath: datPath}
+		go p.init()
+		packs[lang] = p
+	}
+	return packs
+}()
+
+func packForLang(lang string) *installedPack {
+	return packRegistry[lang]
+}
+
+func lookupLang(word, lang string) *LexEntry {
+	if p := packForLang(lang); p != nil {
+		return p.Lookup(word)
+	}
+	return nil
 }
 
 // ── Wiktionary XML types (used by 'lexify -i') ───────────────────────────────
@@ -987,7 +1029,7 @@ func fetchGTX(word, lang string) *Translation {
 	if translated == "" || strings.EqualFold(translated, word) {
 		return nil
 	}
-	return &Translation{Word: translated, Detected: detected}
+	return &Translation{Word: translated, Detected: detected, Source: "gtx"}
 }
 
 // fetchMyMemory is a documented, stable, no-key fallback (5k chars/day free).
@@ -1010,7 +1052,7 @@ func fetchMyMemory(word, lang string) *Translation {
 	if t == "" || strings.EqualFold(t, word) || strings.Contains(strings.ToUpper(t), "INVALID") {
 		return nil
 	}
-	return &Translation{Word: t, Detected: "en"}
+	return &Translation{Word: t, Detected: "en", Source: "mymemory"}
 }
 
 func fetchTranslation(word, lang string) *Translation {
@@ -1398,6 +1440,7 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	var (
 		synTargets  = make([][]string, len(translateLangs))
 		tSynTargets = make([]time.Duration, len(translateLangs))
+		synPackHits = make([]bool, len(translateLangs))
 	)
 	var wg2 sync.WaitGroup
 
@@ -1436,12 +1479,19 @@ func run(word string, translateLangs []string, debug, offline bool) {
 			wordTrans[i] = fetchTranslation(word, lang)
 			tWordTrans[i] = time.Since(t)
 			// Fire target-language syns immediately — overlaps with defn/etym.
+			// If an installed pack exists for this lang, query it directly;
+			// otherwise fall back to the Wiktionary API scrape.
 			if wordTrans[i] != nil && wordTrans[i].Word != "" {
 				wg2.Add(1)
 				go func() {
 					defer wg2.Done()
 					t2 := time.Now()
-					synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
+					if e := lookupLang(wordTrans[i].Word, lang); e != nil {
+						synTargets[i] = e.Syns
+						synPackHits[i] = true
+					} else {
+						synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
+					}
 					tSynTargets[i] = time.Since(t2)
 				}()
 			}
@@ -1542,8 +1592,8 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		tEtymTrans     time.Duration
 	)
 
-	// Fire defn/etym text translations — these are the only remaining Phase-2
-	// goroutines; syns goroutines were already launched during Phase 1.
+	// Fire defn/etym text translations — always via API, since pack definitions
+	// for non-EN words are English glosses, not target-language prose.
 	wg2.Add(2)
 	go func() {
 		defer wg2.Done()
@@ -1567,12 +1617,15 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	{
 		mapped := make([][]string, len(validIdx))
 		mappedT := make([]time.Duration, len(validIdx))
+		mappedHits := make([]bool, len(validIdx))
 		for j, idx := range validIdx {
 			mapped[j] = synTargets[idx]
 			mappedT[j] = tSynTargets[idx]
+			mappedHits[j] = synPackHits[idx]
 		}
 		synTargets = mapped
 		tSynTargets = mappedT
+		synPackHits = mappedHits
 	}
 
 	// Clear the "looking up…" line
@@ -1580,24 +1633,86 @@ func run(word string, translateLangs []string, debug, offline bool) {
 
 	var fetchLog []string
 	if debug {
+		maxDur := func(ds ...time.Duration) time.Duration {
+			var m time.Duration
+			for _, d := range ds {
+				if d > m {
+					m = d
+				}
+			}
+			return m
+		}
+		row := func(label string, ms int64, src string) string {
+			srcStr := ""
+			if src != "" {
+				srcStr = "  " + src
+			}
+			return fmt.Sprintf("│  %-12s %5dms%s", label, ms, srcStr)
+		}
+		header := func(phase string, total time.Duration) string {
+			return fmt.Sprintf("├─ %s (%dms) %s", phase, total.Milliseconds(),
+				strings.Repeat("─", max(0, 27-len(phase)-len(fmt.Sprintf("(%dms)", total.Milliseconds())))))
+		}
+
+		// Phase 1 wall time = max of all parallel tasks in wg1.
+		var p1Durations []time.Duration
 		if entry != nil {
-			fetchLog = append(fetchLog, fmt.Sprintf("  xdg          %dms", tEmbed.Milliseconds()))
+			p1Durations = append(p1Durations, tEmbed)
 		} else {
-			fetchLog = append(fetchLog,
-				fmt.Sprintf("  defn         %dms", tAPI.Milliseconds()),
-				fmt.Sprintf("  etym         %dms", tAPIEtym.Milliseconds()))
+			p1Durations = append(p1Durations, tAPI, tAPIEtym)
+		}
+		for _, d := range tWordTrans {
+			p1Durations = append(p1Durations, d)
+		}
+		p1Total := maxDur(p1Durations...)
+
+		// Phase 2 wall time = max of all parallel tasks in wg2.
+		var p2Durations []time.Duration
+		for _, d := range tSynTargets {
+			p2Durations = append(p2Durations, d)
+		}
+		p2Durations = append(p2Durations, tDefnTrans, tEtymTrans)
+		p2Total := maxDur(p2Durations...)
+
+		var p1, p2 []string
+		if entry != nil {
+			p1 = append(p1, row("xdg(en)", tEmbed.Milliseconds(), ""))
+		} else {
+			p1 = append(p1, row("defn", tAPI.Milliseconds(), "api"))
+			p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
 		}
 		for i, lang := range translateLangs {
-			fetchLog = append(fetchLog, fmt.Sprintf("  trans(%s)     %dms", lang, tWordTrans[i].Milliseconds()))
-			if tSynTargets[i] > 0 {
-				fetchLog = append(fetchLog, fmt.Sprintf("  syns(%s)      %dms", lang, tSynTargets[i].Milliseconds()))
+			src := ""
+			if wordTrans[i] != nil {
+				src = wordTrans[i].Source
+			}
+			p1 = append(p1, row("trans("+lang+")", tWordTrans[i].Milliseconds(), src))
+		}
+		for i, lang := range translateLangs {
+			if tSynTargets[i] > 0 || synPackHits[i] {
+				synSrc := "api"
+				if synPackHits[i] {
+					synSrc = "xdg"
+				}
+				p2 = append(p2, row("syns("+lang+")", tSynTargets[i].Milliseconds(), synSrc))
 			}
 		}
 		if tDefnTrans > 0 {
-			fetchLog = append(fetchLog, fmt.Sprintf("  defn-trans   %dms", tDefnTrans.Milliseconds()))
+			p2 = append(p2, row("defn-trans", tDefnTrans.Milliseconds(), "gtx"))
 		}
 		if tEtymTrans > 0 {
-			fetchLog = append(fetchLog, fmt.Sprintf("  etym-trans   %dms", tEtymTrans.Milliseconds()))
+			p2 = append(p2, row("etym-trans", tEtymTrans.Milliseconds(), "gtx"))
+		}
+
+		if len(p1) > 0 {
+			fetchLog = append(fetchLog, "┌"+strings.Repeat("─", 33))
+			fetchLog = append(fetchLog, header("phase 1", p1Total))
+			fetchLog = append(fetchLog, p1...)
+			if len(p2) > 0 {
+				fetchLog = append(fetchLog, header("phase 2", p2Total))
+				fetchLog = append(fetchLog, p2...)
+			}
+			fetchLog = append(fetchLog, "└"+strings.Repeat("─", 33))
 		}
 	}
 

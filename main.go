@@ -672,8 +672,6 @@ func parseWiktionaryPage(wikitext, langSection string) (LexEntry, bool) {
 	return LexEntry{IPA: ipa, Meanings: meanings, Syns: allSyns, Etym: etym}, true
 }
 
-
-
 // ── Fetchers ──────────────────────────────────────────────────────────────────
 
 func fetchDefinition(word string) *Definition {

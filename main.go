@@ -1109,16 +1109,85 @@ func fetchEtymologyWiki(word string) string {
 }
 
 // fetchTargetSynonyms fetches synonyms from the target-language Wiktionary.
+// It first tries heading-based extraction (works on en, fr, …); if that yields
+// nothing it falls back to inline-template extraction (de, nl, … embed synonyms
+// as {{Synonyme}}/{{Synoniemen}} inline rather than as a dedicated section).
 func fetchTargetSynonyms(word, lang string) []string {
-	wt := wiktionarySection(
-		"https://"+lang+".wiktionary.org/w/api.php", word,
-		func(line string) bool { return synHeadingPat.MatchString(line) },
-	)
+	apiBase := "https://" + lang + ".wiktionary.org/w/api.php"
+
+	// Fetch full page wikitext in one request.
+	var resp struct {
+		Query struct {
+			Pages map[string]struct {
+				Revisions []struct {
+					Text string `json:"*"`
+				} `json:"revisions"`
+			} `json:"pages"`
+		} `json:"query"`
+	}
+	if err := fetchJSON(apiBase+"?action=query&titles="+url.QueryEscape(word)+"&prop=revisions&rvprop=content&format=json", &resp); err != nil {
+		return nil
+	}
+	var fullText string
+	for _, p := range resp.Query.Pages {
+		if len(p.Revisions) > 0 {
+			fullText = p.Revisions[0].Text
+		}
+	}
+	if fullText == "" {
+		return nil
+	}
+
+	lines := strings.Split(fullText, "\n")
+
+	// Method 1: section-heading extraction (en.wiktionary.org style).
+	wt := func() string {
+		var buf []string
+		inSec := false
+		for _, line := range lines {
+			level, heading := parseWikiHeading(line)
+			if level > 0 {
+				if inSec {
+					break
+				}
+				if synHeadingPat.MatchString(heading) {
+					inSec = true
+				}
+				continue
+			}
+			if inSec {
+				buf = append(buf, line)
+			}
+		}
+		return strings.Join(buf, "\n")
+	}()
+
+	// Method 2: inline template extraction (de.wiktionary.org style — {{Synonyme}}).
+	if wt == "" {
+		inlineRe := regexp.MustCompile(`(?i)\{\{Synonym`)
+		var buf []string
+		collecting := false
+		for _, line := range lines {
+			if !collecting {
+				if inlineRe.MatchString(line) {
+					collecting = true
+					buf = append(buf, line)
+				}
+			} else {
+				if strings.HasPrefix(line, "{{") || strings.HasPrefix(strings.TrimSpace(line), "==") {
+					break
+				}
+				buf = append(buf, line)
+			}
+		}
+		wt = strings.Join(buf, "\n")
+	}
+
 	if wt == "" {
 		return nil
 	}
 
-	// Extract [[word]] or [[word|display]] from wikitext — these are the synonyms
+	// Extract [[word]] or [[word|display]] from wikitext — these are the synonyms.
 	linkRe := regexp.MustCompile(`\[\[(?:[^\]|]+\|)?([^\]|]+)\]\]`)
 	matches := linkRe.FindAllStringSubmatch(wt, -1)
 
@@ -1131,8 +1200,10 @@ func fetchTargetSynonyms(word, lang string) []string {
 		if len(runes) < 2 || len(runes) > 30 {
 			continue
 		}
-		if unicode.IsUpper(runes[0]) {
-			continue // skip proper nouns / section headings
+		// English only: skip uppercase-initial (proper nouns / headings).
+		// Other languages (e.g. German) capitalise all nouns, so we allow them.
+		if lang == "en" && unicode.IsUpper(runes[0]) {
+			continue
 		}
 		if digitSlashRe.MatchString(w) {
 			continue
@@ -1201,6 +1272,18 @@ func render(in RenderInput) {
 	if in.ResolvedEN != "" {
 		wordDisplay += Dim + " → " + R + Bold + CWord + in.ResolvedEN + R
 	}
+	// Append target-language translations inline (mirrors the ResolvedEN → style).
+	if len(in.Translations) > 0 {
+		var parts []string
+		for _, t := range in.Translations {
+			if t != nil && t.Word != "" {
+				parts = append(parts, Bold+CTrans+t.Word+R)
+			}
+		}
+		if len(parts) > 0 {
+			wordDisplay += Dim + " → " + R + strings.Join(parts, Dim+" · "+R)
+		}
+	}
 	fmt.Printf("  %s  %s%s%s  %s[%s]%s\n",
 		wordDisplay, CEx, phonetic, R, Dim, langTag, R)
 	fmt.Println(divider())
@@ -1211,19 +1294,6 @@ func render(in RenderInput) {
 	}
 	if len(in.Warnings) > 0 {
 		fmt.Println()
-	}
-
-	// ── translations ──────────────────────────────────────────────────────────
-	if len(in.Translations) > 0 {
-		fmt.Print(sectionHeader(ITrans, "TRANSLATIONS"))
-		for i, t := range in.Translations {
-			langCode := strings.ToUpper(in.TargetLangs[i])
-			if t == nil {
-				fmt.Printf("  %s%s%s  %s(translation failed)%s\n\n", CPos+Bold, langCode, R, CEx, R)
-				continue
-			}
-			fmt.Printf("  %s%s%s  %s%s%s\n\n", CPos+Bold, langCode, R, CTrans+Bold, t.Word, R)
-		}
 	}
 
 	// ── definition ────────────────────────────────────────────────────────────
@@ -1486,7 +1556,7 @@ func run(word string, translateLangs []string, debug, offline bool) {
 				go func() {
 					defer wg2.Done()
 					t2 := time.Now()
-					if e := lookupLang(wordTrans[i].Word, lang); e != nil {
+					if e := lookupLang(wordTrans[i].Word, lang); e != nil && len(e.Syns) > 0 {
 						synTargets[i] = e.Syns
 						synPackHits[i] = true
 					} else {

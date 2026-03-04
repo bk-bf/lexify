@@ -1440,7 +1440,7 @@ func printHelp() {
 	fmt.Printf("  %s-i <lang>%s  install offline pack  (e.g. lexify -i en)\n", CPos, R)
 	fmt.Printf("  %s  --kaikki%s  source: kaikki.org JSONL  ~500 MB, ~2 min  %s(default)%s\n", CPos, R, Dim, R)
 	fmt.Printf("  %s  --wiki%s   source: en.wiktionary.org XML dump  ~1.2 GB, ~10 min\n", CPos, R)
-	fmt.Printf("  %s-o%s         use installed offline pack\n", CPos, R)
+	fmt.Printf("  %s-o%s         force live API (skip installed pack)\n", CPos, R)
 	fmt.Printf("  %s-d%s         show per-fetch debug timing\n\n", CPos, R)
 
 	fmt.Printf("  %s%sEXAMPLES%s\n", CHead, Bold, R)
@@ -1472,7 +1472,7 @@ func printHelp() {
 		fmt.Println()
 	}
 	fmt.Println(divider())
-	fmt.Println(wordWrap("EN lookups are fully offline · translations fire in parallel · no API keys", dividerWidth-4, "  "))
+	fmt.Println(wordWrap("uses installed pack automatically · -o forces live API · translations fire in parallel · no API keys", dividerWidth-4, "  "))
 	fmt.Println()
 }
 
@@ -1501,13 +1501,14 @@ func contains(s []string, v string) bool {
 
 // ── Orchestration ─────────────────────────────────────────────────────────────
 
-func run(word string, translateLangs []string, debug, offline bool) {
+func run(word string, translateLangs []string, debug, apiOnly bool) {
 	start := time.Now()
 	fmt.Printf("\n  %slooking up %s%s%s%s…%s\r", CEx, Bold, word, R, CEx, R)
 
-	// ── Phase 1: optional XDG lookup + word translations — fully parallel ──────────
-	// When -o is given, lookupEN is fired alongside translations so gob decode
-	// overlaps with network RTT. Without -o the API path is used exclusively.
+	// ── Phase 1: XDG lookup (when pack installed) + word translations — fully parallel ─
+	// By default, lookupEN is fired when a pack is available; its goroutine fires inline
+	// API fallback calls on a pack miss so translations overlap either way.
+	// -o (apiOnly) skips XDG entirely and always hits the network APIs.
 	var (
 		entry      *LexEntry
 		defn       *Definition
@@ -1536,18 +1537,41 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	)
 	var wg2 sync.WaitGroup
 
+	useXDG := !apiOnly && usingInstalledPack
+
 	var wg1 sync.WaitGroup
 	wg1.Add(len(translateLangs))
-	if offline {
+	if useXDG {
 		wg1.Add(1)
 		go func() {
 			defer wg1.Done()
 			t := time.Now()
 			entry = lookupEN(word)
 			tEmbed = time.Since(t)
+			if entry == nil {
+				// Pack miss — fall back to API while translations are still in flight.
+				var wgFB sync.WaitGroup
+				wgFB.Add(2)
+				go func() {
+					defer wgFB.Done()
+					t2 := time.Now()
+					apiDefn = fetchDefinition(word)
+					tAPI = time.Since(t2)
+				}()
+				go func() {
+					defer wgFB.Done()
+					t2 := time.Now()
+					apiEtym = fetchEtymologyWiki(word)
+					tAPIEtym = time.Since(t2)
+				}()
+				wgFB.Wait()
+				if apiDefn != nil {
+					apiFallback = true
+				}
+			}
 		}()
 	} else {
-		// Fire definition + etymology in parallel with translations.
+		// API-only: default when no pack installed, or when -o is passed.
 		// Total Phase-1 cost = max(defn_rtt, etym_rtt, trans_rtt).
 		wg1.Add(2)
 		go func() {
@@ -1612,7 +1636,7 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	if entry == nil && defn == nil {
 		if enTrans := fetchGTX(word, "en"); enTrans != nil {
 			resolvedEN = enTrans.Word
-			if offline {
+			if !apiOnly && usingInstalledPack {
 				if e := lookupEN(enTrans.Word); e != nil {
 					entry = e
 					defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
@@ -1623,17 +1647,12 @@ func run(word string, translateLangs []string, debug, offline bool) {
 			if entry == nil {
 				if d := fetchDefinition(enTrans.Word); d != nil {
 					defn = d
-					if offline {
+					if !apiOnly && usingInstalledPack {
 						apiFallback = true
 					}
 				}
 			}
 		}
-	}
-	// Direct EN pack miss in offline mode: XDG was queried but returned nothing
-	// and no non-EN routing saved us — mark fallback if API was used any other way.
-	if offline && entry == nil && defn != nil && !apiFallback {
-		apiFallback = true
 	}
 
 	var warnings []string
@@ -2209,7 +2228,7 @@ func main() {
 	}
 	word := strings.TrimSpace(os.Args[1])
 	debug := false
-	offline := false
+	apiOnly := false
 	var translateLangs []string
 	for _, a := range os.Args[2:] {
 		if a == "-d" {
@@ -2217,7 +2236,7 @@ func main() {
 			continue
 		}
 		if a == "-o" {
-			offline = true
+			apiOnly = true
 			continue
 		}
 		l := strings.ToLower(strings.TrimSpace(a))
@@ -2225,5 +2244,5 @@ func main() {
 			translateLangs = append(translateLangs, l)
 		}
 	}
-	run(word, translateLangs, debug, offline)
+	run(word, translateLangs, debug, apiOnly)
 }

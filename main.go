@@ -1110,6 +1110,8 @@ func fetchTargetSynonyms(word, lang string) []string {
 
 type RenderInput struct {
 	Word           string
+	ResolvedEN     string // non-empty when input was non-EN and translated to this EN word
+	APIFallback    bool   // true when -o was set but pack had no entry and API was used instead
 	TargetLangs    []string
 	Defn           *Definition
 	SynSource      []string
@@ -1153,8 +1155,12 @@ func render(in RenderInput) {
 
 	// ── header ────────────────────────────────────────────────────────────────
 	fmt.Println()
-	fmt.Printf("  %s%s%s  %s%s%s  %s[%s]%s\n",
-		CWord, Bold+in.Word, R, CEx, phonetic, R, Dim, langTag, R)
+	wordDisplay := Bold + CWord + in.Word + R
+	if in.ResolvedEN != "" {
+		wordDisplay += Dim + " → " + R + Bold + CWord + in.ResolvedEN + R
+	}
+	fmt.Printf("  %s  %s%s%s  %s[%s]%s\n",
+		wordDisplay, CEx, phonetic, R, Dim, langTag, R)
 	fmt.Println(divider())
 
 	// ── warnings ─────────────────────────────────────────────────────────────
@@ -1258,7 +1264,11 @@ func render(in RenderInput) {
 		fmt.Println()
 	}
 
-	fmt.Printf("  %sfetched in %dms%s\n", Dim, in.Elapsed.Milliseconds(), R)
+	fallbackNote := ""
+	if in.APIFallback {
+		fallbackNote = fmt.Sprintf("  %s⚠ pack miss → api%s", CErr, R)
+	}
+	fmt.Printf("  %sfetched in %dms%s%s\n", Dim, in.Elapsed.Milliseconds(), R, fallbackNote)
 	if len(in.FetchLog) > 0 {
 		for _, line := range in.FetchLog {
 			fmt.Printf("  %s%s%s\n", Dim, line, R)
@@ -1376,8 +1386,10 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		tAPIEtym   time.Duration
 	)
 	var (
-		apiDefn *Definition
-		apiEtym string
+		apiDefn     *Definition
+		apiEtym     string
+		resolvedEN  string // set when input is non-EN and routed through an EN translation
+		apiFallback bool   // set when -o pack miss forces an API call
 	)
 
 	// synTargets and wg2 are declared here so trans goroutines can chain
@@ -1449,35 +1461,39 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		etym = apiEtym
 	}
 
-	// Non-EN source word routing: if lookup missed and translation API detected
-	// a non-English source, translate to EN and retry (XDG only when -o).
+	// Non-EN source word routing: if lookup missed, try treating the input as a
+	// non-English word. fetchGTX returns nil when the translation equals the
+	// input (i.e. the word is already English), so this is safe to call
+	// unconditionally — no detectedSrc guard needed. This also covers the case
+	// where the only target lang is "en" (fetchTranslation short-circuits to nil
+	// for that lang, so wordTrans[0] would be nil and Detected would be unavailable).
 	if entry == nil && defn == nil {
-		detectedSrc := ""
-		if len(wordTrans) > 0 && wordTrans[0] != nil {
-			detectedSrc = wordTrans[0].Detected
-		}
-		if detectedSrc != "" && detectedSrc != "en" {
-			if enTrans := fetchGTX(word, "en"); enTrans != nil {
-				if offline {
-					if e := lookupEN(enTrans.Word); e != nil {
-						entry = e
-						defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
-						synSource = e.Syns
-						etym = e.Etym
-					}
+		if enTrans := fetchGTX(word, "en"); enTrans != nil {
+			resolvedEN = enTrans.Word
+			if offline {
+				if e := lookupEN(enTrans.Word); e != nil {
+					entry = e
+					defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
+					synSource = e.Syns
+					etym = e.Etym
 				}
-				if entry == nil {
-					if d := fetchDefinition(enTrans.Word); d != nil {
-						defn = d
+			}
+			if entry == nil {
+				if d := fetchDefinition(enTrans.Word); d != nil {
+					defn = d
+					if offline {
+						apiFallback = true
 					}
 				}
 			}
 		}
 	}
+	// Direct EN pack miss in offline mode: XDG was queried but returned nothing
+	// and no non-EN routing saved us — mark fallback if API was used any other way.
+	if offline && entry == nil && defn != nil && !apiFallback {
+		apiFallback = true
+	}
 
-	// ── Validate languages: drop any whose word translation fully failed ───────
-	// Track original indices so synTargets (filled asynchronously) can be
-	// remapped after wg2.Wait().
 	var warnings []string
 	var validIdx []int
 	{
@@ -1587,6 +1603,8 @@ func run(word string, translateLangs []string, debug, offline bool) {
 
 	render(RenderInput{
 		Word:           word,
+		ResolvedEN:     resolvedEN,
+		APIFallback:    apiFallback,
 		TargetLangs:    translateLangs,
 		Defn:           defn,
 		SynSource:      synSource,

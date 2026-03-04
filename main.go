@@ -1,7 +1,7 @@
 // lexify — word lookup: definition · synonyms · etymology · translation
 // Usage: lexify <word> [lang ...]
 // APIs: dictionaryapi.dev · datamuse.com · en.wiktionary.org · google gtx
-// Deps: github.com/schollz/progressbar/v3 (install subcommand only)
+// Deps: stdlib only
 package main
 
 import (
@@ -26,8 +26,6 @@ import (
 	"time"
 	"unicode"
 	"unsafe"
-
-	"github.com/schollz/progressbar/v3"
 )
 
 // ── ANSI constants ────────────────────────────────────────────────────────────
@@ -1836,6 +1834,121 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	})
 }
 
+// ── Progress bar (stdlib-only, terminal-width-safe) ─────────────────────────────────────────────
+
+var spinnerFrames = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func fmtBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
+// installProgress is a terminal-width-aware progress bar for the install subcommand.
+// It writes a single overwriting line via "\r\033[2K" and caps the bar to
+// dividerWidth columns so the line never wraps — eliminating the newline-spam
+// that occurs when \r only returns to the start of the current visual row.
+type installProgress struct {
+	desc    string
+	total   int64 // -1 = indeterminate
+	written int64
+	start   time.Time
+	last    time.Time
+	frame   int
+	mu      sync.Mutex
+}
+
+func newProgress(total int64, desc string) *installProgress {
+	p := &installProgress{
+		desc:  desc,
+		total: total,
+		start: time.Now(),
+		last:  time.Now().Add(-100 * time.Millisecond), // force first render
+	}
+	p.render()
+	return p
+}
+
+func (p *installProgress) render() {
+	elapsed := time.Since(p.start).Seconds()
+	speed := float64(0)
+	if elapsed > 0.001 {
+		speed = float64(p.written) / elapsed
+	}
+	desc := fmt.Sprintf("%-13s", p.desc)
+	suffix := fmt.Sprintf("  %s  %s/s", fmtBytes(p.written), fmtBytes(int64(speed)))
+
+	var bar string
+	if p.total > 0 {
+		pct := float64(p.written) / float64(p.total)
+		if pct > 1 {
+			pct = 1
+		}
+		pctStr := fmt.Sprintf("  %3.0f%%", pct*100)
+		suffix = pctStr + suffix
+		// "  " prefix(2) + desc(13) + " "(1) + bar(barW) + suffix — total ≤ dividerWidth+2
+		barW := dividerWidth - 16 - runeLen(suffix)
+		if barW < 6 {
+			barW = 6
+		}
+		filled := int(pct * float64(barW))
+		bar = " " + strings.Repeat("█", filled) + strings.Repeat("░", barW-filled)
+	} else {
+		// indeterminate: spinner only
+		bar = " " + spinnerFrames[p.frame%len(spinnerFrames)]
+	}
+
+	line := fmt.Sprintf("  %s%s%s", desc, bar, suffix)
+	// Hard-clamp to terminal width as a last resort against wrapping.
+	runes := []rune(line)
+	if len(runes) > dividerWidth+2 {
+		runes = runes[:dividerWidth+2]
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[2K%s", string(runes))
+}
+
+func (p *installProgress) Write(b []byte) (int, error) {
+	n := len(b)
+	p.mu.Lock()
+	p.written += int64(n)
+	now := time.Now()
+	if now.Sub(p.last) >= 80*time.Millisecond {
+		p.last = now
+		p.frame++
+		p.render()
+	}
+	p.mu.Unlock()
+	return n, nil
+}
+
+func (p *installProgress) Finish() {
+	p.mu.Lock()
+	p.render()
+	p.mu.Unlock()
+	fmt.Fprintln(os.Stderr)
+}
+
+// progressReader wraps an io.Reader, reporting bytes read to an installProgress.
+type progressReader struct {
+	r    io.Reader
+	prog *installProgress
+}
+
+func (pr *progressReader) Read(b []byte) (int, error) {
+	n, err := pr.r.Read(b)
+	if n > 0 {
+		pr.prog.Write(b[:n]) //nolint:errcheck
+	}
+	return n, err
+}
+
 // ── Install subcommand  (-i / --install) ────────────────────────────────────────────────────────
 
 // cmdInstall downloads and indexes a language pack for offline use.
@@ -1845,25 +1958,6 @@ func cmdInstall(lang, source string) {
 	if !ok {
 		fmt.Fprintf(os.Stderr, "lexify -i: unsupported language %q\n  supported: en de fr es it pt ru ja zh ko nl pl sv ar tr uk hi\n", lang)
 		os.Exit(1)
-	}
-	newBar := func(max int64, desc string) *progressbar.ProgressBar {
-		opts := []progressbar.Option{
-			progressbar.OptionSetDescription(fmt.Sprintf("  %-13s", desc)),
-			progressbar.OptionSetWidth(32),
-			progressbar.OptionSetTheme(progressbar.Theme{
-				Saucer:        "█",
-				SaucerPadding: "░",
-				BarStart:      "",
-				BarEnd:        "",
-			}),
-			progressbar.OptionSetRenderBlankState(true),
-			progressbar.OptionShowBytes(true),
-			progressbar.OptionSetWriter(os.Stderr),
-			progressbar.OptionOnCompletion(func() { fmt.Fprintln(os.Stderr) }),
-			progressbar.OptionUseANSICodes(true),
-			progressbar.OptionEnableColorCodes(false),
-		}
-		return progressbar.NewOptions64(max, opts...)
 	}
 
 	dataDir := xdgDataDir()
@@ -1934,10 +2028,10 @@ func cmdInstall(lang, source string) {
 		fmt.Fprintf(os.Stderr, "lexify -i: create temp: %v\n", err)
 		os.Exit(1)
 	}
-	dlBar := newBar(resp.ContentLength, "downloading")
+	dlBar := newProgress(resp.ContentLength, "downloading")
 	n, err := io.Copy(io.MultiWriter(f, dlBar), resp.Body)
 	f.Close()
-	_ = dlBar.Finish()
+	dlBar.Finish()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lexify -i: download: %v\n", err)
 		os.Exit(1)
@@ -1951,14 +2045,14 @@ func cmdInstall(lang, source string) {
 		fmt.Fprintf(os.Stderr, "lexify -i: open: %v\n", err)
 		os.Exit(1)
 	}
-	parseBar := newBar(fileSize, "parsing")
-	parseRdr := progressbar.NewReader(rdr, parseBar)
+	parseBar := newProgress(fileSize, "parsing")
+	parseRdr := &progressReader{r: rdr, prog: parseBar}
 	index := make(map[string]LexEntry, 500_000)
 	var total int
 
 	switch source {
 	case "kaikki":
-		scanner := bufio.NewScanner(&parseRdr)
+		scanner := bufio.NewScanner(parseRdr)
 		scanner.Buffer(make([]byte, 4<<20), 4<<20)
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -1978,7 +2072,7 @@ func cmdInstall(lang, source string) {
 			total++
 		}
 	default: // wiki
-		bzRdr := bzip2.NewReader(&parseRdr)
+		bzRdr := bzip2.NewReader(parseRdr)
 		decoder := xml.NewDecoder(bzRdr)
 		for {
 			tok, err := decoder.Token()
@@ -2009,7 +2103,7 @@ func cmdInstall(lang, source string) {
 		}
 	}
 	rdr.Close()
-	_ = parseBar.Finish()
+	parseBar.Finish()
 	fmt.Fprintf(os.Stderr, "  %s%dk words%s indexed in %.1fs\n",
 		Dim, total/1000, R, time.Since(t0).Seconds())
 
@@ -2026,7 +2120,7 @@ func cmdInstall(lang, source string) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
 
-	packBar := newBar(-1, "packing")
+	packBar := newProgress(-1, "packing")
 	datPath := filepath.Join(dataDir, lang+".dat")
 	datF, err := os.Create(datPath)
 	if err != nil {
@@ -2055,6 +2149,7 @@ func cmdInstall(lang, source string) {
 		if _, err := datF.Write(entryBytes); err != nil {
 			break
 		}
+		packBar.Write(entryBytes) //nolint:errcheck
 		clear(idxRecord)
 		copy(idxRecord[:idxKeySize], []byte(kv.key))
 		binary.BigEndian.PutUint64(idxRecord[idxKeySize:], datOffset)
@@ -2065,7 +2160,7 @@ func cmdInstall(lang, source string) {
 	}
 	datF.Close()
 	idxF.Close()
-	_ = packBar.Finish()
+	packBar.Finish()
 	if st, err := os.Stat(datPath); err == nil {
 		fmt.Fprintf(os.Stderr, "  %s%.1f MB%s written  →  %s\n",
 			Dim, float64(st.Size())/(1024*1024), R, datPath)

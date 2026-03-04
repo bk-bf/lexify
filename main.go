@@ -1,16 +1,23 @@
 // lexify — word lookup: definition · synonyms · etymology · translation
 // Usage: lexify <word> [lang ...]
 // APIs: dictionaryapi.dev · datamuse.com · en.wiktionary.org · google gtx
-// Deps: stdlib only
+// Deps: github.com/schollz/progressbar/v3 (install subcommand only)
 package main
 
 import (
+	_ "embed"
+
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -18,6 +25,8 @@ import (
 	"time"
 	"unicode"
 	"unsafe"
+
+	"github.com/schollz/progressbar/v3"
 )
 
 // ── ANSI constants ────────────────────────────────────────────────────────────
@@ -66,6 +75,15 @@ const (
 	IEty   = "\uf017 "
 	ITrans = "\uf0ac "
 )
+
+// ── Embedded data ────────────────────────────────────────────────────────────
+
+//go:embed data/en.bin.gz
+var enPackData []byte
+
+// embeddedHasData is false when only the build-time placeholder (204 B) is present.
+// Used to decide whether to suggest 'lexify install en'.
+var embeddedHasData = len(enPackData) > 1000
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 
@@ -322,6 +340,194 @@ type Translation struct {
 	Detected string
 }
 
+// LexEntry is the value stored in each embedded data pack entry.
+// Field names must match tools/prepare_data.go exactly for gob round-trips.
+type LexEntry struct {
+	IPA      string
+	Meanings []Meaning
+	Syns     []string // union across senses; caller trims to display limit
+	Etym     string
+}
+
+// LookupProvider abstracts over the embedded EN pack and user-installed packs.
+type LookupProvider interface {
+	Lookup(word string) *LexEntry // nil on miss
+}
+
+// embeddedEN is the LookupProvider backed by enPackData (shipped with binary).
+type embeddedEN struct {
+	once sync.Once
+	data map[string]LexEntry
+}
+
+func (p *embeddedEN) init() {
+	p.once.Do(func() {
+		gr, err := gzip.NewReader(bytes.NewReader(enPackData))
+		if err != nil {
+			return
+		}
+		defer gr.Close()
+		p.data = make(map[string]LexEntry)
+		gob.NewDecoder(gr).Decode(&p.data) //nolint
+	})
+}
+
+func (p *embeddedEN) Lookup(word string) *LexEntry {
+	p.init()
+	if e, ok := p.data[strings.ToLower(word)]; ok {
+		return &e
+	}
+	return nil
+}
+
+// xdgDataDir returns ~/.local/share/lexify (or $XDG_DATA_HOME/lexify).
+func xdgDataDir() string {
+	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
+		return filepath.Join(d, "lexify")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "lexify")
+}
+
+// installedPack is the LookupProvider backed by a user-installed pack on disk.
+type installedPack struct {
+	path string
+	once sync.Once
+	data map[string]LexEntry
+}
+
+func (p *installedPack) init() {
+	p.once.Do(func() {
+		f, err := os.Open(p.path)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return
+		}
+		defer gr.Close()
+		p.data = make(map[string]LexEntry)
+		gob.NewDecoder(gr).Decode(&p.data) //nolint
+	})
+}
+
+func (p *installedPack) Lookup(word string) *LexEntry {
+	p.init()
+	if e, ok := p.data[strings.ToLower(word)]; ok {
+		return &e
+	}
+	return nil
+}
+
+// enProvider is the active EN LookupProvider.
+// Prefers the user-installed XDG pack; falls back to the embedded pack.
+var enProvider, usingInstalledPack = func() (LookupProvider, bool) {
+	xdgPath := filepath.Join(xdgDataDir(), "en.bin.gz")
+	if _, err := os.Stat(xdgPath); err == nil {
+		return &installedPack{path: xdgPath}, true
+	}
+	return &embeddedEN{}, false
+}()
+
+func lookupEN(word string) *LexEntry { return enProvider.Lookup(word) }
+
+// ── Kaikki JSONL types (used by 'lexify install') ─────────────────────────────
+
+// kEntry mirrors the Kaikki JSONL schema for stream-parsing.
+type kEntry struct {
+	Word   string `json:"word"`
+	POS    string `json:"pos"`
+	Sounds []struct {
+		IPA  string   `json:"ipa"`
+		Tags []string `json:"tags"`
+	} `json:"sounds"`
+	Senses []struct {
+		Glosses  []string `json:"glosses"`
+		Examples []struct {
+			Text string `json:"text"`
+		} `json:"examples"`
+		Synonyms []struct {
+			Word string `json:"word"`
+		} `json:"synonyms"`
+	} `json:"senses"`
+	Synonyms []struct {
+		Word string `json:"word"`
+	} `json:"synonyms"`
+	EtymologyText string `json:"etymology_text"`
+	LangCode      string `json:"lang_code"`
+}
+
+func convertKEntry(k kEntry) (string, LexEntry) {
+	key := strings.ToLower(strings.TrimSpace(k.Word))
+	ipa := ""
+	for _, s := range k.Sounds {
+		if strings.HasPrefix(s.IPA, "/") || strings.HasPrefix(s.IPA, "[") {
+			ipa = s.IPA
+			break
+		}
+	}
+	if ipa == "" && len(k.Sounds) > 0 {
+		ipa = k.Sounds[0].IPA
+	}
+	pos := strings.TrimSpace(k.POS)
+	var defs []Def
+	seenSyn := map[string]bool{}
+	var senseSyns []string
+	for _, s := range k.Senses {
+		if len(s.Glosses) == 0 {
+			continue
+		}
+		example := ""
+		if len(s.Examples) > 0 {
+			example = s.Examples[0].Text
+		}
+		defs = append(defs, Def{Text: s.Glosses[0], Example: example})
+		for _, syn := range s.Synonyms {
+			w := strings.TrimSpace(syn.Word)
+			if w != "" && !seenSyn[w] {
+				seenSyn[w] = true
+				senseSyns = append(senseSyns, w)
+			}
+		}
+	}
+	for _, syn := range k.Synonyms {
+		w := strings.TrimSpace(syn.Word)
+		if w != "" && !seenSyn[w] {
+			seenSyn[w] = true
+			senseSyns = append(senseSyns, w)
+		}
+	}
+	var meanings []Meaning
+	if pos != "" && len(defs) > 0 {
+		meanings = append(meanings, Meaning{POS: pos, Defs: defs, Syns: senseSyns})
+	}
+	etym := strings.TrimSpace(k.EtymologyText)
+	return key, LexEntry{IPA: ipa, Meanings: meanings, Syns: senseSyns, Etym: etym}
+}
+
+func mergeEntry(existing, incoming LexEntry) LexEntry {
+	existing.Meanings = append(existing.Meanings, incoming.Meanings...)
+	seen := map[string]bool{}
+	for _, s := range existing.Syns {
+		seen[s] = true
+	}
+	for _, s := range incoming.Syns {
+		if !seen[s] {
+			seen[s] = true
+			existing.Syns = append(existing.Syns, s)
+		}
+	}
+	if existing.IPA == "" {
+		existing.IPA = incoming.IPA
+	}
+	if existing.Etym == "" {
+		existing.Etym = incoming.Etym
+	}
+	return existing
+}
+
 // ── Fetchers ──────────────────────────────────────────────────────────────────
 
 func fetchDefinition(word string) *Definition {
@@ -359,119 +565,6 @@ func fetchDefinition(word string) *Definition {
 		d.Meanings = append(d.Meanings, meaning)
 	}
 	return d
-}
-
-func fetchSynonyms(word string) []string {
-	var raw []struct {
-		Word string `json:"word"`
-	}
-	if err := fetchJSON("https://api.datamuse.com/words?rel_syn="+url.QueryEscape(word)+"&max=14", &raw); err != nil {
-		return nil
-	}
-	out := make([]string, 0, len(raw))
-	for _, r := range raw {
-		out = append(out, r.Word)
-	}
-	return out
-}
-
-// fetchEnWiktionary fetches the English Wiktionary page once and extracts both
-// the etymology text and a synonym list in a single HTTP round-trip, replacing
-// the separate datamuse + wiktionary calls used in Phase 1.
-// Falls back to datamuse for synonyms when the Wiktionary page has no Synonyms section.
-func fetchEnWiktionary(word string) (etym string, syns []string) {
-	const base = "https://en.wiktionary.org/w/api.php"
-	var resp struct {
-		Query struct {
-			Pages map[string]struct {
-				Revisions []struct {
-					Text string `json:"*"`
-				} `json:"revisions"`
-			} `json:"pages"`
-		} `json:"query"`
-	}
-	if err := fetchJSON(base+"?action=query&titles="+url.QueryEscape(word)+"&prop=revisions&rvprop=content&format=json", &resp); err != nil {
-		return "", nil
-	}
-	var fullText string
-	for _, p := range resp.Query.Pages {
-		if len(p.Revisions) > 0 {
-			fullText = p.Revisions[0].Text
-		}
-	}
-	if fullText == "" {
-		return "", nil
-	}
-
-	const (
-		stNone = iota
-		stEtym
-		stSyn
-	)
-	isEtymHeading := func(h string) bool {
-		l := strings.ToLower(h)
-		return l == "etymology" || strings.HasPrefix(l, "etymology")
-	}
-	state := stNone
-	etymDone := false // stop after first non-empty paragraph (blank line ends it)
-	var etymLines, synLines []string
-	for _, line := range strings.Split(fullText, "\n") {
-		_, heading := parseWikiHeading(line)
-		if heading != "" {
-			state = stNone
-			if !etymDone && isEtymHeading(heading) {
-				state = stEtym
-			} else if synHeadingPat.MatchString(heading) {
-				state = stSyn
-			}
-			continue
-		}
-		switch state {
-		case stEtym:
-			if strings.TrimSpace(line) == "" {
-				if len(etymLines) > 0 {
-					etymDone = true
-					state = stNone // stop collecting etymology after first blank line
-				}
-			} else {
-				etymLines = append(etymLines, line)
-			}
-		case stSyn:
-			synLines = append(synLines, line)
-		}
-	}
-
-	// Process etymology
-	if len(etymLines) > 0 {
-		clean := strings.TrimSpace(stripWikitext(strings.Join(etymLines, "\n")))
-		if runes := []rune(clean); len(runes) > 700 {
-			clean = string(runes[:700])
-		}
-		etym = clean
-	}
-
-	// Extract synonym links from Wiktionary
-	if len(synLines) > 0 {
-		linkRe := regexp.MustCompile(`\[\[(?:[^\]|]+\|)?([^\]|]+)\]\]`)
-		digitSlashRe := regexp.MustCompile(`[\d/]`)
-		seen := map[string]bool{}
-		for _, m := range linkRe.FindAllStringSubmatch(strings.Join(synLines, "\n"), -1) {
-			w := strings.TrimSpace(m[1])
-			rs := []rune(w)
-			if len(rs) < 2 || len(rs) > 30 || unicode.IsUpper(rs[0]) || digitSlashRe.MatchString(w) {
-				continue
-			}
-			if !seen[w] {
-				seen[w] = true
-				syns = append(syns, w)
-			}
-			if len(syns) >= 14 {
-				break
-			}
-		}
-	}
-
-	return etym, syns
 }
 
 // parseWikiHeading returns the heading level and trimmed title for a wikitext
@@ -646,12 +739,8 @@ var synHeadingPat = regexp.MustCompile(
 		`)`,
 )
 
-// English: Datamuse. Other languages: Wiktionary synonym section via action=parse.
+// fetchTargetSynonyms fetches synonyms from the target-language Wiktionary.
 func fetchTargetSynonyms(word, lang string) []string {
-	if lang == "en" {
-		return fetchSynonyms(word)
-	}
-
 	wt := wiktionarySection(
 		"https://"+lang+".wiktionary.org/w/api.php", word,
 		func(line string) bool { return synHeadingPat.MatchString(line) },
@@ -706,6 +795,7 @@ type RenderInput struct {
 	Warnings       []string
 	Elapsed        time.Duration
 	FetchLog       []string // per-fetch timing lines
+	Hint           string   // shown at bottom when offline data is unavailable
 }
 
 func render(in RenderInput) {
@@ -848,6 +938,9 @@ func render(in RenderInput) {
 			fmt.Printf("  %s%s%s\n", Dim, line, R)
 		}
 	}
+	if in.Hint != "" {
+		fmt.Printf("  %s→ %s%s\n", Dim, in.Hint, R)
+	}
 	fmt.Println(divider())
 	fmt.Println()
 }
@@ -894,10 +987,10 @@ func printHelp() {
 
 	fmt.Printf("  %s%sDATA SOURCES%s\n", CHead, Bold, R)
 	sources := [][2]string{
-		{IDef + "Definition", "dictionaryapi.dev  (English source words)"},
-		{ISyn + "Synonyms", "datamuse.com  (EN) · Wiktionary (other langs)"},
-		{IEty + "Etymology", "en.wiktionary.org  (action=parse, wikitext)"},
-		{ITrans + "Translation", "Google Translate gtx  · MyMemory fallback (no key)"},
+		{IDef + "Definition", "kaikki.org / wiktextract  ·  embedded (offline, EN)  ·  dictionaryapi.dev fallback"},
+		{ISyn + "Synonyms", "kaikki.org / wiktextract  ·  embedded (offline, EN)  ·  Wiktionary (target langs)"},
+		{IEty + "Etymology", "kaikki.org / wiktextract  ·  embedded (offline, EN)"},
+		{ITrans + "Translation", "Google Translate gtx  ·  MyMemory fallback  (no key)"},
 	}
 	for _, s := range sources {
 		fmt.Printf("  %s%s%s%s\n", CHead, Bold, s[0], R)
@@ -905,7 +998,7 @@ func printHelp() {
 		fmt.Println()
 	}
 	fmt.Println(divider())
-	fmt.Println(wordWrap("all requests fire in parallel · no API keys · no local deps", dividerWidth-4, "  "))
+	fmt.Println(wordWrap("EN lookups are fully offline · translations fire in parallel · no API keys", dividerWidth-4, "  "))
 	fmt.Println()
 }
 
@@ -938,33 +1031,32 @@ func run(word string, translateLangs []string, debug bool) {
 	start := time.Now()
 	fmt.Printf("\n  %slooking up %s%s%s%s…%s\r", CEx, Bold, word, R, CEx, R)
 
-	// ── Phase 1: parallel source fetches + word translations ─────────────────
+	// ── Phase 1: embedded lookup (instant) + parallel word translations ────────
+	// lookupEN queries the embedded Kaikki data; falls back to the network API
+	// when the word is absent (inflected forms, neologisms, non-EN source words).
+	entry := lookupEN(word)
+
 	var (
-		defn      *Definition
-		synSource []string
-		etym      string
-		wordTrans = make([]*Translation, len(translateLangs))
-		// per-goroutine timings — each written by exactly one goroutine, no mutex needed
-		tDefn, tWiki time.Duration
-		tWordTrans   = make([]time.Duration, len(translateLangs))
+		defn       *Definition
+		synSource  []string
+		etym       string
+		wordTrans  = make([]*Translation, len(translateLangs))
+		tWordTrans = make([]time.Duration, len(translateLangs))
 	)
 
 	var wg1 sync.WaitGroup
-	wg1.Add(2 + len(translateLangs))
-
-	go func() {
-		defer wg1.Done()
-		t := time.Now()
-		defn = fetchDefinition(word)
-		tDefn = time.Since(t)
-	}()
-	go func() {
-		// Single en.wiktionary.org call extracts both etymology and EN synonyms.
-		defer wg1.Done()
-		t := time.Now()
-		etym, synSource = fetchEnWiktionary(word)
-		tWiki = time.Since(t)
-	}()
+	var apiDefn *Definition
+	var tAPI time.Duration
+	if entry == nil {
+		wg1.Add(1)
+		go func() {
+			defer wg1.Done()
+			t := time.Now()
+			apiDefn = fetchDefinition(word)
+			tAPI = time.Since(t)
+		}()
+	}
+	wg1.Add(len(translateLangs))
 	for i, lang := range translateLangs {
 		i, lang := i, lang
 		go func() {
@@ -975,6 +1067,34 @@ func run(word string, translateLangs []string, debug bool) {
 		}()
 	}
 	wg1.Wait()
+
+	// Populate defn/synSource/etym from embedded entry or API fallback.
+	if entry != nil {
+		defn = &Definition{Phonetic: entry.IPA, Meanings: entry.Meanings}
+		synSource = entry.Syns
+		etym = entry.Etym
+	} else if apiDefn != nil {
+		defn = apiDefn
+	}
+
+	// Non-EN source word routing: if the embedded lookup missed and the
+	// translation API detected a non-English source, translate to EN and retry.
+	if entry == nil && defn == nil {
+		detectedSrc := ""
+		if len(wordTrans) > 0 && wordTrans[0] != nil {
+			detectedSrc = wordTrans[0].Detected
+		}
+		if detectedSrc != "" && detectedSrc != "en" {
+			if enTrans := fetchGTX(word, "en"); enTrans != nil {
+				if e := lookupEN(enTrans.Word); e != nil {
+					entry = e
+					defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
+					synSource = e.Syns
+					etym = e.Etym
+				}
+			}
+		}
+	}
 
 	// ── Validate languages: drop any whose word translation fully failed ───────
 	var warnings []string
@@ -1062,15 +1182,16 @@ func run(word string, translateLangs []string, debug bool) {
 
 	var fetchLog []string
 	if debug {
-		fetchLog = append(fetchLog,
-			fmt.Sprintf("phase 1 (parallel):"),
-			fmt.Sprintf("  definition   %dms", tDefn.Milliseconds()),
-			fmt.Sprintf("  wiktionary   %dms", tWiki.Milliseconds()),
-		)
+		if entry != nil {
+			fetchLog = append(fetchLog, "phase 1:", "  lookup       embedded (0ms)")
+		} else {
+			fetchLog = append(fetchLog, "phase 1:",
+				fmt.Sprintf("  api fallback  %dms", tAPI.Milliseconds()))
+		}
 		for i, lang := range translateLangs {
 			fetchLog = append(fetchLog, fmt.Sprintf("  trans(%s)     %dms", lang, tWordTrans[i].Milliseconds()))
 		}
-		fetchLog = append(fetchLog, fmt.Sprintf("phase 2 (parallel):"))
+		fetchLog = append(fetchLog, "phase 2 (parallel):")
 		for i, lang := range translateLangs {
 			if tSynTargets[i] > 0 {
 				fetchLog = append(fetchLog, fmt.Sprintf("  syns(%s)      %dms", lang, tSynTargets[i].Milliseconds()))
@@ -1082,6 +1203,11 @@ func run(word string, translateLangs []string, debug bool) {
 		if tEtymTrans > 0 {
 			fetchLog = append(fetchLog, fmt.Sprintf("  etym-trans   %dms", tEtymTrans.Milliseconds()))
 		}
+	}
+
+	hint := ""
+	if !usingInstalledPack && !embeddedHasData {
+		hint = "run 'lexify install en' for offline lookups"
 	}
 
 	render(RenderInput{
@@ -1098,7 +1224,164 @@ func run(word string, translateLangs []string, debug bool) {
 		Warnings:       warnings,
 		Elapsed:        time.Since(start),
 		FetchLog:       fetchLog,
+		Hint:           hint,
 	})
+}
+
+// ── Install subcommand ──────────────────────────────────────────────────────────────
+
+var kaikkiLangNames = map[string]string{
+	"de": "German", "fr": "French", "es": "Spanish", "it": "Italian",
+	"pt": "Portuguese", "ru": "Russian", "ja": "Japanese", "zh": "Chinese",
+	"ko": "Korean", "nl": "Dutch", "pl": "Polish", "sv": "Swedish",
+	"ar": "Arabic", "tr": "Turkish", "uk": "Ukrainian", "hi": "Hindi",
+}
+
+func kaikkiURL(lang string) (string, error) {
+	if lang == "en" {
+		return "https://kaikki.org/dictionary/English/kaikki.org-dictionary-English.jsonl", nil
+	}
+	name, ok := kaikkiLangNames[lang]
+	if !ok {
+		return "", fmt.Errorf("no kaikki.org pack available for %q", lang)
+	}
+	return fmt.Sprintf("https://kaikki.org/dictionary/%s/kaikki.org-dictionary-%s.jsonl", name, name), nil
+}
+
+func cmdInstall(lang string) {
+	// newBar returns a progressbar writing to stderr.
+	// max=-1 → indeterminate (spinner + byte counter); max>0 → percentage bar.
+	// Descriptions must be plain text — ANSI codes break the library's width math.
+	newBar := func(max int64, desc string) *progressbar.ProgressBar {
+		opts := []progressbar.Option{
+			progressbar.OptionSetDescription(fmt.Sprintf("  %-13s", desc)),
+			progressbar.OptionSetWidth(32),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer:        "█",
+				SaucerPadding: "░",
+				BarStart:      "",
+				BarEnd:        "",
+			}),
+			progressbar.OptionSetRenderBlankState(true),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionSetWriter(os.Stderr),
+			progressbar.OptionOnCompletion(func() { fmt.Fprintln(os.Stderr) }),
+			progressbar.OptionUseANSICodes(true),
+			progressbar.OptionEnableColorCodes(false),
+		}
+		return progressbar.NewOptions64(max, opts...)
+	}
+
+	dlURL, err := kaikkiURL(lang)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "lexify install: "+err.Error())
+		os.Exit(1)
+	}
+	dataDir := xdgDataDir()
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: mkdir %s: %v\n", dataDir, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n  installing %s%s%s language pack\n\n", Bold, strings.ToUpper(lang), R)
+
+	// ── Step 1: download JSONL ─────────────────────────────────────────
+	jsonlTmp := filepath.Join(dataDir, lang+".jsonl.tmp")
+	defer os.Remove(jsonlTmp)
+
+	resp, err := http.Get(dlURL) //nolint:gosec
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: download: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "lexify install: HTTP %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	f, err := os.Create(jsonlTmp)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: create temp: %v\n", err)
+		os.Exit(1)
+	}
+	dlBar := newBar(resp.ContentLength, "downloading")
+	n, err := io.Copy(io.MultiWriter(f, dlBar), resp.Body)
+	f.Close()
+	_ = dlBar.Finish()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: download: %v\n", err)
+		os.Exit(1)
+	}
+	fileSize := n
+
+	// ── Step 2: stream-parse JSONL ────────────────────────────────────
+	t0 := time.Now()
+	rdr, err := os.Open(jsonlTmp)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: open: %v\n", err)
+		os.Exit(1)
+	}
+	parseBar := newBar(fileSize, "parsing")
+	parseRdr := progressbar.NewReader(rdr, parseBar)
+	index := make(map[string]LexEntry, 1_000_000)
+	scanner := bufio.NewScanner(&parseRdr)
+	scanner.Buffer(make([]byte, 4<<20), 4<<20)
+	var total int
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var k kEntry
+		if json.Unmarshal(line, &k) != nil || k.LangCode != lang || strings.TrimSpace(k.Word) == "" {
+			continue
+		}
+		key, entry := convertKEntry(k)
+		if existing, ok := index[key]; ok {
+			index[key] = mergeEntry(existing, entry)
+		} else {
+			index[key] = entry
+		}
+		total++
+	}
+	rdr.Close()
+	_ = parseBar.Finish()
+	fmt.Fprintf(os.Stderr, "  %s%dk words%s indexed in %.1fs\n",
+		Dim, total/1000, R, time.Since(t0).Seconds())
+
+	// ── Step 3: write bin.gz ───────────────────────────────────────────
+	packBar := newBar(-1, "packing")
+	binPath := filepath.Join(dataDir, lang+".bin.gz")
+	out, err := os.Create(binPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: create bin: %v\n", err)
+		os.Exit(1)
+	}
+	defer out.Close()
+	gw, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: gzip: %v\n", err)
+		os.Exit(1)
+	}
+	if err := gob.NewEncoder(gw).Encode(index); err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: encode: %v\n", err)
+		os.Exit(1)
+	}
+	if err := gw.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "lexify install: gzip close: %v\n", err)
+		os.Exit(1)
+	}
+	_ = packBar.Finish()
+	stat, _ := out.Stat()
+	fmt.Fprintf(os.Stderr, "  %s%.1f MB%s written  →  %s\n",
+		Dim, float64(stat.Size())/(1024*1024), R, binPath)
+
+	// ── Version file ────────────────────────────────────────────────────
+	ver := fmt.Sprintf("source: %s\nbuilt:  %s\n", dlURL, time.Now().Format(time.RFC3339))
+	os.WriteFile(filepath.Join(dataDir, lang+".version"), []byte(ver), 0o644) //nolint
+
+	fmt.Printf("\n  %s%s pack installed.%s  run 'lexify <word>' to use it.\n\n",
+		Bold+CSyn, strings.ToUpper(lang), R)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1106,6 +1389,14 @@ func run(word string, translateLangs []string, debug bool) {
 func main() {
 	if len(os.Args) < 2 || os.Args[1] == "-h" || os.Args[1] == "--help" {
 		printHelp()
+		return
+	}
+	if os.Args[1] == "install" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: lexify install <lang>")
+			os.Exit(1)
+		}
+		cmdInstall(strings.ToLower(strings.TrimSpace(os.Args[2])))
 		return
 	}
 	word := strings.TrimSpace(os.Args[1])

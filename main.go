@@ -1323,6 +1323,9 @@ func render(in RenderInput) {
 					ex := strings.Join(strings.Fields(d.Example), " ")
 					fmt.Printf("%s%s%s\n", CEx, wordWrap("\""+ex+"\"", dividerWidth-4, "  "), R)
 				}
+				if i < len(m.Defs)-1 {
+					fmt.Println()
+				}
 			}
 			fmt.Println()
 		}

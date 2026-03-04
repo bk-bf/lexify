@@ -5,10 +5,7 @@
 package main
 
 import (
-	_ "embed"
-
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"encoding/gob"
 	"encoding/json"
@@ -75,15 +72,6 @@ const (
 	IEty   = "\uf017 "
 	ITrans = "\uf0ac "
 )
-
-// ── Embedded data ────────────────────────────────────────────────────────────
-
-//go:embed data/en.bin.gz
-var enPackData []byte
-
-// embeddedHasData is false when only the build-time placeholder (204 B) is present.
-// Used to decide whether to suggest 'lexify install en'.
-var embeddedHasData = len(enPackData) > 1000
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 
@@ -354,32 +342,6 @@ type LookupProvider interface {
 	Lookup(word string) *LexEntry // nil on miss
 }
 
-// embeddedEN is the LookupProvider backed by enPackData (shipped with binary).
-type embeddedEN struct {
-	once sync.Once
-	data map[string]LexEntry
-}
-
-func (p *embeddedEN) init() {
-	p.once.Do(func() {
-		gr, err := gzip.NewReader(bytes.NewReader(enPackData))
-		if err != nil {
-			return
-		}
-		defer gr.Close()
-		p.data = make(map[string]LexEntry)
-		gob.NewDecoder(gr).Decode(&p.data) //nolint
-	})
-}
-
-func (p *embeddedEN) Lookup(word string) *LexEntry {
-	p.init()
-	if e, ok := p.data[strings.ToLower(word)]; ok {
-		return &e
-	}
-	return nil
-}
-
 // xdgDataDir returns ~/.local/share/lexify (or $XDG_DATA_HOME/lexify).
 func xdgDataDir() string {
 	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
@@ -421,17 +383,25 @@ func (p *installedPack) Lookup(word string) *LexEntry {
 	return nil
 }
 
-// enProvider is the active EN LookupProvider.
-// Prefers the user-installed XDG pack; falls back to the embedded pack.
+// enProvider is the active EN LookupProvider, backed by a user-installed XDG pack.
+// nil when no pack is installed; lookupEN returns nil in that case and run() falls
+// back to the dictionaryapi.dev network API.
 var enProvider, usingInstalledPack = func() (LookupProvider, bool) {
 	xdgPath := filepath.Join(xdgDataDir(), "en.bin.gz")
 	if _, err := os.Stat(xdgPath); err == nil {
-		return &installedPack{path: xdgPath}, true
+		p := &installedPack{path: xdgPath}
+		go p.init()
+		return p, true
 	}
-	return &embeddedEN{}, false
+	return nil, false
 }()
 
-func lookupEN(word string) *LexEntry { return enProvider.Lookup(word) }
+func lookupEN(word string) *LexEntry {
+	if enProvider == nil {
+		return nil
+	}
+	return enProvider.Lookup(word)
+}
 
 // ── Kaikki JSONL types (used by 'lexify install') ─────────────────────────────
 
@@ -481,7 +451,19 @@ func convertKEntry(k kEntry) (string, LexEntry) {
 		}
 		example := ""
 		if len(s.Examples) > 0 {
-			example = s.Examples[0].Text
+			ex := []rune(strings.TrimSpace(s.Examples[0].Text))
+			if len(ex) > 150 {
+				// back up to last space so we don't cut mid-word
+				i := 147
+				for i > 0 && ex[i] != ' ' {
+					i--
+				}
+				if i == 0 {
+					i = 147
+				}
+				ex = append(ex[:i], '…')
+			}
+			example = string(ex)
 		}
 		defs = append(defs, Def{Text: s.Glosses[0], Example: example})
 		for _, syn := range s.Synonyms {
@@ -503,7 +485,36 @@ func convertKEntry(k kEntry) (string, LexEntry) {
 	if pos != "" && len(defs) > 0 {
 		meanings = append(meanings, Meaning{POS: pos, Defs: defs, Syns: senseSyns})
 	}
-	etym := strings.TrimSpace(k.EtymologyText)
+	etymRunes := []rune(strings.TrimSpace(k.EtymologyText))
+	etym := ""
+	if len(etymRunes) <= 500 {
+		etym = string(etymRunes)
+	} else {
+		// Cut at last sentence boundary before 500 runes.
+		cut := -1
+		for i := 499; i >= 0; i-- {
+			r := etymRunes[i]
+			if r == '.' || r == '!' || r == '?' {
+				if i+1 == len(etymRunes) || etymRunes[i+1] == ' ' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		if cut > 0 {
+			etym = strings.TrimSpace(string(etymRunes[:cut])) + "…"
+		} else {
+			// No sentence boundary found — fall back to word boundary.
+			i := 497
+			for i > 0 && etymRunes[i] != ' ' {
+				i--
+			}
+			if i == 0 {
+				i = 497
+			}
+			etym = string(etymRunes[:i]) + "…"
+		}
+	}
 	return key, LexEntry{IPA: ipa, Meanings: meanings, Syns: senseSyns, Etym: etym}
 }
 
@@ -969,6 +980,10 @@ func printHelp() {
 	fmt.Printf("  %slexify%s %s<word>%s %s<lang>%s\n", CPos, R, CSyn, R, CTrans, R)
 	fmt.Printf("  %slexify%s %s<word>%s %s<lang> <lang>%s %s...%s\n\n", CPos, R, CSyn, R, CTrans, R, CEx, R)
 
+	fmt.Printf("  %s%sFLAGS%s\n", CHead, Bold, R)
+	fmt.Printf("  %s-o%s  use offline XDG pack (requires: lexify install <lang>)\n", CPos, R)
+	fmt.Printf("  %s-d%s  show per-fetch debug timing\n\n", CPos, R)
+
 	fmt.Printf("  %s%sEXAMPLES%s\n", CHead, Bold, R)
 	examples := [][2]string{
 		{"lexify serendipity", "English definition, synonyms, etymology"},
@@ -1027,36 +1042,34 @@ func contains(s []string, v string) bool {
 
 // ── Orchestration ─────────────────────────────────────────────────────────────
 
-func run(word string, translateLangs []string, debug bool) {
+func run(word string, translateLangs []string, debug, offline bool) {
 	start := time.Now()
 	fmt.Printf("\n  %slooking up %s%s%s%s…%s\r", CEx, Bold, word, R, CEx, R)
 
-	// ── Phase 1: embedded lookup (instant) + parallel word translations ────────
-	// lookupEN queries the embedded Kaikki data; falls back to the network API
-	// when the word is absent (inflected forms, neologisms, non-EN source words).
-	entry := lookupEN(word)
-
+	// ── Phase 1: optional XDG lookup + word translations — fully parallel ──────────
+	// When -o is given, lookupEN is fired alongside translations so gob decode
+	// overlaps with network RTT. Without -o the API path is used exclusively.
 	var (
+		entry      *LexEntry
 		defn       *Definition
 		synSource  []string
 		etym       string
 		wordTrans  = make([]*Translation, len(translateLangs))
 		tWordTrans = make([]time.Duration, len(translateLangs))
+		tEmbed     time.Duration
 	)
 
 	var wg1 sync.WaitGroup
-	var apiDefn *Definition
-	var tAPI time.Duration
-	if entry == nil {
+	wg1.Add(len(translateLangs))
+	if offline {
 		wg1.Add(1)
 		go func() {
 			defer wg1.Done()
 			t := time.Now()
-			apiDefn = fetchDefinition(word)
-			tAPI = time.Since(t)
+			entry = lookupEN(word)
+			tEmbed = time.Since(t)
 		}()
 	}
-	wg1.Add(len(translateLangs))
 	for i, lang := range translateLangs {
 		i, lang := i, lang
 		go func() {
@@ -1068,6 +1081,15 @@ func run(word string, translateLangs []string, debug bool) {
 	}
 	wg1.Wait()
 
+	// API definition fallback — fires when XDG missed or -o not used.
+	var apiDefn *Definition
+	var tAPI time.Duration
+	if entry == nil {
+		t := time.Now()
+		apiDefn = fetchDefinition(word)
+		tAPI = time.Since(t)
+	}
+
 	// Populate defn/synSource/etym from embedded entry or API fallback.
 	if entry != nil {
 		defn = &Definition{Phonetic: entry.IPA, Meanings: entry.Meanings}
@@ -1077,8 +1099,8 @@ func run(word string, translateLangs []string, debug bool) {
 		defn = apiDefn
 	}
 
-	// Non-EN source word routing: if the embedded lookup missed and the
-	// translation API detected a non-English source, translate to EN and retry.
+	// Non-EN source word routing: if lookup missed and translation API detected
+	// a non-English source, translate to EN and retry (XDG only when -o).
 	if entry == nil && defn == nil {
 		detectedSrc := ""
 		if len(wordTrans) > 0 && wordTrans[0] != nil {
@@ -1086,11 +1108,18 @@ func run(word string, translateLangs []string, debug bool) {
 		}
 		if detectedSrc != "" && detectedSrc != "en" {
 			if enTrans := fetchGTX(word, "en"); enTrans != nil {
-				if e := lookupEN(enTrans.Word); e != nil {
-					entry = e
-					defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
-					synSource = e.Syns
-					etym = e.Etym
+				if offline {
+					if e := lookupEN(enTrans.Word); e != nil {
+						entry = e
+						defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
+						synSource = e.Syns
+						etym = e.Etym
+					}
+				}
+				if entry == nil {
+					if d := fetchDefinition(enTrans.Word); d != nil {
+						defn = d
+					}
 				}
 			}
 		}
@@ -1183,10 +1212,10 @@ func run(word string, translateLangs []string, debug bool) {
 	var fetchLog []string
 	if debug {
 		if entry != nil {
-			fetchLog = append(fetchLog, "phase 1:", "  lookup       embedded (0ms)")
+			fetchLog = append(fetchLog, "phase 1:", fmt.Sprintf("  lookup       xdg (%dms)", tEmbed.Milliseconds()))
 		} else {
 			fetchLog = append(fetchLog, "phase 1:",
-				fmt.Sprintf("  api fallback  %dms", tAPI.Milliseconds()))
+				fmt.Sprintf("  api %dms", tAPI.Milliseconds()))
 		}
 		for i, lang := range translateLangs {
 			fetchLog = append(fetchLog, fmt.Sprintf("  trans(%s)     %dms", lang, tWordTrans[i].Milliseconds()))
@@ -1206,8 +1235,12 @@ func run(word string, translateLangs []string, debug bool) {
 	}
 
 	hint := ""
-	if !usingInstalledPack && !embeddedHasData {
-		hint = "run 'lexify install en' for offline lookups"
+	if !offline {
+		if usingInstalledPack {
+			hint = "use -o for offline lookups"
+		} else {
+			hint = "run 'lexify install en' then use -o for offline lookups"
+		}
 	}
 
 	render(RenderInput{
@@ -1401,10 +1434,15 @@ func main() {
 	}
 	word := strings.TrimSpace(os.Args[1])
 	debug := false
+	offline := false
 	var translateLangs []string
 	for _, a := range os.Args[2:] {
 		if a == "-d" {
 			debug = true
+			continue
+		}
+		if a == "-o" {
+			offline = true
 			continue
 		}
 		l := strings.ToLower(strings.TrimSpace(a))
@@ -1412,5 +1450,5 @@ func main() {
 			translateLangs = append(translateLangs, l)
 		}
 	}
-	run(word, translateLangs, debug)
+	run(word, translateLangs, debug, offline)
 }

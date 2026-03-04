@@ -1,11 +1,7 @@
 # Documentation files
 
-# Data directory — ignore downloads and generated packs; keep the build-time placeholder
-data/*.jsonl
-data/*.jsonl.gz
-data/*.bin.gz
-!data/en.bin.gz
-data/*.version
+# Data directory — user-installed packs, downloads, generated files (not part of build)
+data/
 
 # Binary
 lexify

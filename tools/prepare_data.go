@@ -105,7 +105,19 @@ func convert(k kEntry) (string, LexEntry) {
 		}
 		example := ""
 		if len(s.Examples) > 0 {
-			example = s.Examples[0].Text
+			ex := []rune(strings.TrimSpace(s.Examples[0].Text))
+			end := -1
+			for i, r := range ex {
+				if r == '.' || r == '!' || r == '?' {
+					if i+1 == len(ex) || ex[i+1] == ' ' {
+						end = i + 1
+						break
+					}
+				}
+			}
+			if end > 0 && end <= 150 {
+				example = string(ex[:end])
+			}
 		}
 		defs = append(defs, Def{Text: s.Glosses[0], Example: example})
 		for _, syn := range s.Synonyms {
@@ -131,7 +143,34 @@ func convert(k kEntry) (string, LexEntry) {
 		meanings = append(meanings, Meaning{POS: pos, Defs: defs, Syns: senseSyns})
 	}
 
-	etym := strings.TrimSpace(k.EtymologyText)
+	etymRunes := []rune(strings.TrimSpace(k.EtymologyText))
+	etym := ""
+	if len(etymRunes) <= 500 {
+		etym = string(etymRunes)
+	} else {
+		cut := -1
+		for i := 499; i >= 0; i-- {
+			r := etymRunes[i]
+			if r == '.' || r == '!' || r == '?' {
+				if i+1 == len(etymRunes) || etymRunes[i+1] == ' ' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		if cut > 0 {
+			etym = strings.TrimSpace(string(etymRunes[:cut])) + "…"
+		} else {
+			i := 497
+			for i > 0 && etymRunes[i] != ' ' {
+				i--
+			}
+			if i == 0 {
+				i = 497
+			}
+			etym = string(etymRunes[:i]) + "…"
+		}
+	}
 	return key, LexEntry{IPA: ipa, Meanings: meanings, Syns: senseSyns, Etym: etym}
 }
 

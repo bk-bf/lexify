@@ -750,6 +750,22 @@ var synHeadingPat = regexp.MustCompile(
 		`)`,
 )
 
+// fetchEtymologyWiki fetches and strips the Etymology section from en.wiktionary.org.
+// Single API call (action=query&prop=revisions); runs in parallel with fetchDefinition.
+func fetchEtymologyWiki(word string) string {
+	wt := wiktionarySection(
+		"https://en.wiktionary.org/w/api.php", word,
+		func(heading string) bool {
+			h := strings.ToLower(heading)
+			return h == "etymology" || strings.HasPrefix(h, "etymology ")
+		},
+	)
+	if wt == "" {
+		return ""
+	}
+	return stripWikitext(wt)
+}
+
 // fetchTargetSynonyms fetches synonyms from the target-language Wiktionary.
 func fetchTargetSynonyms(word, lang string) []string {
 	wt := wiktionarySection(
@@ -1057,6 +1073,12 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		wordTrans  = make([]*Translation, len(translateLangs))
 		tWordTrans = make([]time.Duration, len(translateLangs))
 		tEmbed     time.Duration
+		tAPI       time.Duration
+		tAPIEtym   time.Duration
+	)
+	var (
+		apiDefn *Definition
+		apiEtym string
 	)
 
 	var wg1 sync.WaitGroup
@@ -1068,6 +1090,22 @@ func run(word string, translateLangs []string, debug, offline bool) {
 			t := time.Now()
 			entry = lookupEN(word)
 			tEmbed = time.Since(t)
+		}()
+	} else {
+		// Fire definition + etymology in parallel with translations.
+		// Total Phase-1 cost = max(defn_rtt, etym_rtt, trans_rtt).
+		wg1.Add(2)
+		go func() {
+			defer wg1.Done()
+			t := time.Now()
+			apiDefn = fetchDefinition(word)
+			tAPI = time.Since(t)
+		}()
+		go func() {
+			defer wg1.Done()
+			t := time.Now()
+			apiEtym = fetchEtymologyWiki(word)
+			tAPIEtym = time.Since(t)
 		}()
 	}
 	for i, lang := range translateLangs {
@@ -1081,22 +1119,16 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	}
 	wg1.Wait()
 
-	// API definition fallback — fires when XDG missed or -o not used.
-	var apiDefn *Definition
-	var tAPI time.Duration
-	if entry == nil {
-		t := time.Now()
-		apiDefn = fetchDefinition(word)
-		tAPI = time.Since(t)
-	}
-
-	// Populate defn/synSource/etym from embedded entry or API fallback.
+	// Populate defn/synSource/etym from XDG entry or parallel API results.
 	if entry != nil {
 		defn = &Definition{Phonetic: entry.IPA, Meanings: entry.Meanings}
 		synSource = entry.Syns
 		etym = entry.Etym
-	} else if apiDefn != nil {
-		defn = apiDefn
+	} else {
+		if apiDefn != nil {
+			defn = apiDefn
+		}
+		etym = apiEtym
 	}
 
 	// Non-EN source word routing: if lookup missed and translation API detected
@@ -1215,7 +1247,8 @@ func run(word string, translateLangs []string, debug, offline bool) {
 			fetchLog = append(fetchLog, "phase 1:", fmt.Sprintf("  lookup       xdg (%dms)", tEmbed.Milliseconds()))
 		} else {
 			fetchLog = append(fetchLog, "phase 1:",
-				fmt.Sprintf("  api %dms", tAPI.Milliseconds()))
+				fmt.Sprintf("  defn         %dms", tAPI.Milliseconds()),
+				fmt.Sprintf("  etym         %dms", tAPIEtym.Milliseconds()))
 		}
 		for i, lang := range translateLangs {
 			fetchLog = append(fetchLog, fmt.Sprintf("  trans(%s)     %dms", lang, tWordTrans[i].Milliseconds()))

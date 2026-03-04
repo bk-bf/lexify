@@ -341,7 +341,7 @@ type Translation struct {
 }
 
 // LexEntry is the value stored in each embedded data pack entry.
-// Field names must match tools/prepare_data.go exactly for gob round-trips.
+// Field names must be stable — gob round-trips between cmdInstall (writer) and installedPack.Lookup (reader).
 type LexEntry struct {
 	IPA      string
 	Meanings []Meaning

@@ -1319,7 +1319,9 @@ func render(in RenderInput) {
 			for i, d := range m.Defs {
 				fmt.Println(wordWrap(fmt.Sprintf("%d. %s", i+1, d.Text), dividerWidth-4, "  "))
 				if d.Example != "" {
-					fmt.Printf("  %s\"%s\"%s\n", CEx, d.Example, R)
+					// Normalize embedded newlines/whitespace before wrapping.
+					ex := strings.Join(strings.Fields(d.Example), " ")
+					fmt.Printf("%s%s%s\n", CEx, wordWrap("\""+ex+"\"", dividerWidth-4, "  "), R)
 				}
 			}
 			fmt.Println()

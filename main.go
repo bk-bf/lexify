@@ -1382,6 +1382,24 @@ func render(in RenderInput) {
 	if in.APIFallback {
 		fallbackNote = fmt.Sprintf("  %s⚠ pack miss → api%s", CErr, R)
 	}
+
+	// ── fine print: absent sections ───────────────────────────────────────────
+	var absent []string
+	if len(allSyn) == 0 {
+		absent = append(absent, "no synonyms ("+srcLang+")")
+	}
+	for i, lang := range in.TargetLangs {
+		if i >= len(in.SynTargets) || len(in.SynTargets[i]) == 0 {
+			absent = append(absent, "no synonyms ("+strings.ToUpper(lang)+")")
+		}
+	}
+	if etymText == "" {
+		absent = append(absent, "no etymology")
+	}
+	if len(absent) > 0 {
+		fmt.Printf("  %s%s%s\n", Dim, strings.Join(absent, " · "), R)
+	}
+
 	fmt.Printf("  %sfetched in %dms%s%s\n", Dim, in.Elapsed.Milliseconds(), R, fallbackNote)
 	if len(in.FetchLog) > 0 {
 		for _, line := range in.FetchLog {
@@ -1700,8 +1718,12 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		synPackHits = mappedHits
 	}
 
-	// Clear the "looking up…" line
-	fmt.Printf("\033[1A\033[2K")
+	// Clear the "looking up…" line.
+	// The spinner was printed as "\n  looking up...\r" which leaves cursor at
+	// col 0 of the spinner line. \033[2K erases that line, then \033[1A moves up
+	// to the blank line the leading \n created. Without the \033[2K the header
+	// would overwrite the spinner text, leaving trailing chars visible (e.g. “ncy…”).
+	fmt.Printf("\r\033[2K\033[1A")
 
 	var fetchLog []string
 	if debug {
@@ -1751,7 +1773,11 @@ func run(word string, translateLangs []string, debug, offline bool) {
 			p1 = append(p1, row("xdg(en)", tEmbed.Milliseconds(), ""))
 		} else {
 			p1 = append(p1, row("defn", tAPI.Milliseconds(), "api"))
-			p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
+			// Only log etym when something was actually returned; a non-zero
+			// duration with empty result just means wiktionary had no section.
+			if etym != "" {
+				p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
+			}
 		}
 		for i, lang := range translateLangs {
 			src := ""

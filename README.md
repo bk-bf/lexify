@@ -1,6 +1,8 @@
 <img src="assets/image.png" alt="lexify"/>
 
-Terminal word lookup: definition · synonyms · etymology · translation — all in parallel, output in the target language. No API keys. No external dependencies. Pure Go stdlib.
+CLI tool for English word lookup: definition, synonyms, etymology, and optional translation into other languages. No API keys required.
+
+One external dependency: [progressbar](https://github.com/schollz/progressbar) (used only during pack installation).
 
 
 
@@ -34,87 +36,84 @@ lexify <word>
 lexify <word> <lang> [lang ...]
 ```
 
-Pass any BCP-47 language code as `<lang>`. Almost all languages are supported:
+| Flag        | Description                                                    |
+| ----------- | -------------------------------------------------------------- |
+| `-i <lang>` | Install an offline pack for the given language                 |
+| `--kaikki`  | Pack source: kaikki.org JSONL (~500 MB, ~2 min) — default      |
+| `--wiki`    | Pack source: en.wiktionary.org XML dump (~1.2 GB, ~10 min)     |
+| `-o`        | Use installed offline pack instead of live APIs for EN lookups |
+| `-d`        | Show per-fetch debug timing                                    |
+
+Pass any BCP-47 language code as `<lang>`:
 `fr` `ru` `de` `es` `it` `pt` `ja` `zh` `ko` `ar` `nl` `pl` `sv` `tr` `uk` `hi` …
 
-An unrecognised language code is silently dropped and a warning is shown inline — output always falls back to English.
+Unrecognised language codes are dropped with an inline warning; output falls back to English.
 
 
 
 ## Examples
 
-**English only** — definition, synonyms, etymology
+```sh
+# English only
+lexify serendipity
 
-```
-> lexify serendipity
+# With translation (definition, synonyms, etymology rendered in French)
+lexify serendipity fr
 
-  serendipity  /ˌsɛ.ɹən.ˈdɪ.pɪ.ti/  [en]
-  ──────────────────────────────────────────────────────────────────
+# Multiple target languages
+lexify serendipity fr ru
 
-   DEFINITION (EN)
-  noun
-  1. A combination of events which have come together by
-  chance to make a surprisingly good or wonderful outcome.
-  2. An unsought, unintended, and/or unexpected, but
-  fortunate, discovery and/or learning experience that happens
-  by accident.
+# Non-English source word — detected automatically, translated to EN, then looked up
+lexify Schadenfreude en
 
-
-   SYNONYMS (EN)
-  chance · luck
-
-
-   ETYMOLOGY (EN)
-  From Serendip + -ity. based on the Persian story of The
-  Three Princes of Serendip, who (Walpole wrote to a friend)
-  were "always making discoveries, by accidents and sagacity,
-  of things which they were not in quest of".
-
-  ──────────────────────────────────────────────────────────────────
-```
-
-**With translation** — everything above, re-rendered in the target language
-
-```
-> lexify serendipity fr
-```
-
-**Multiple target languages** — parallel output for each
-
-```
-> lexify serendipity fr ru
-```
-
-**Non-English source** — language detected automatically
-
-```
-> lexify Schadenfreude en
+# Use offline pack (requires lexify -i en first)
+lexify serendipity -o
+lexify serendipity de -o
 ```
 
 
 
-## Output
+## Offline packs
 
-| Section             | Source                                          |
-| ------------------- | ----------------------------------------------- |
-| **DEFINITION**      | dictionaryapi.dev                               |
-| **SYNONYMS (EN)**   | datamuse.com                                    |
-| **SYNONYMS (lang)** | Target-language Wiktionary                      |
-| **ETYMOLOGY**       | en.wiktionary.org — `action=parse` wikitext API |
-| **TRANSLATIONS**    | Google Translate `gtx` · MyMemory fallback      |
+Packs are installed per-language into `~/.local/share/lexify/` as a binary-search index (`<lang>.idx` + `<lang>.dat`).
 
-When a target language is provided, the definition and etymology are also translated so the full output is readable in that language.
+```sh
+lexify -i en           # install English pack (~2 min from kaikki.org)
+lexify -i en --wiki    # same, from Wiktionary XML dump (~10 min)
+lexify -i de           # install German pack
+```
+
+With `-o`, EN lookups (definition, synonyms, etymology) are served from the local index (~27 ms) instead of live API calls. If the word is not found in the pack the tool falls back to the APIs and marks this in output with `⚠ pack miss → api`.
+
+When a target-language pack is installed, synonym lookups for that language are also served from the pack; definition and etymology content is still translated via API since the pack stores English-sourced glosses for non-EN words, not native-language prose.
 
 
 
-## Implementation
+## Data sources
 
-**Concurrency** — Phase 1 fires goroutines for definition, synonyms, etymology, and all word translations simultaneously. Phase 2 fans out immediately on Phase 1 results: per-language content translation and target-language synonym fetches run without a second barrier.
+| Section                                  | Source                                               |
+| ---------------------------------------- | ---------------------------------------------------- |
+| Definition (EN)                          | Offline pack — or — dictionaryapi.dev                |
+| Synonyms (EN)                            | Offline pack — or — datamuse.com                     |
+| Etymology (EN)                           | Offline pack — or — en.wiktionary.org `action=parse` |
+| Synonyms (target lang)                   | Installed pack — or — target-lang Wiktionary API     |
+| Translation (word)                       | Google Translate `gtx` endpoint; MyMemory fallback   |
+| Translation (definition, etymology text) | Google Translate `gtx` endpoint                      |
 
-**Wiktionary** — Uses the stable `action=parse` two-step API (section index → wikitext by section number) rather than HTML scraping. Wikitext templates (`{{m}}`, `{{der}}`, `{{bor}}`, `{{suffix}}`, `{{w}}`, …) are resolved via `resolveTemplate`.
+All packs are built from [kaikki.org](https://kaikki.org) or the [Wiktionary XML dump](https://dumps.wikimedia.org/enwiktionary/).
 
-**Multilingual synonyms** — Section headings matched with a single regex covering `Synonyms`, `Synonymes`, `Synonyme`, `Синонимы`, `Sinónimos`, `同義語`, `동의어`, `مرادف`, and more.
 
-**Unicode** — All string widths and substring operations use rune slices, not byte lengths, so Cyrillic, CJK, Arabic, and other scripts wrap and filter correctly.
+
+## Implementation notes
+
+**Concurrency** — Phase 1 fires goroutines for EN lookup (pack or API), and all word translations simultaneously. Phase 2 fans out immediately on Phase 1 results: per-language synonym fetches and text translations run without a second barrier. Use `-d` to see per-task timing split by phase.
+
+**Wiktionary parsing** — Uses the `action=parse` two-step API (section index → wikitext by section number). Wikitext templates (`{{m}}`, `{{der}}`, `{{bor}}`, `{{suffix}}`, `{{w}}`, …) are resolved before display.
+
+**Multilingual synonyms** — Section headings matched with a single regex covering `Synonyms`, `Synonymes`, `Synonyme`, `Синонимы`, `Sinónimos`, `同義語`, `동의어`, `مرادف`, and others.
+
+**Unicode** — String widths and substring operations use rune slices throughout, so Cyrillic, CJK, Arabic, and other scripts wrap correctly.
+
+**Non-EN source words** — If a word returns no definition, the tool translates it to English via GTX and retries the lookup in English (pack or API). The header shows `<original> → <translated>` when this path is taken.
 
 

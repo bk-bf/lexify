@@ -41,7 +41,8 @@ const (
 	CTrans = "\033[1;34m" // bold blue   — translated word
 	CEx    = "\033[37m"   // light grey  — examples / meta
 	//lint:ignore U1000 kept for completeness
-	CErr = "\033[31m" // red — errors
+	CErr = "\033[31m"       // red — errors
+	CBar = "\033[38;5;208m" // orange — install progress bar
 )
 
 // winsize mirrors the kernel struct winsize used by TIOCGWINSZ.
@@ -1899,19 +1900,23 @@ func (p *installProgress) render() {
 			barW = 6
 		}
 		filled := int(pct * float64(barW))
-		bar = " " + strings.Repeat("█", filled) + strings.Repeat("░", barW-filled)
+		bar = " " + CBar + strings.Repeat("█", filled) + R + Dim + strings.Repeat("░", barW-filled) + R
 	} else {
 		// indeterminate: spinner only
-		bar = " " + spinnerFrames[p.frame%len(spinnerFrames)]
+		bar = " " + CBar + spinnerFrames[p.frame%len(spinnerFrames)] + R
 	}
 
 	line := fmt.Sprintf("  %s%s%s", desc, bar, suffix)
 	// Hard-clamp to terminal width as a last resort against wrapping.
-	runes := []rune(line)
-	if len(runes) > dividerWidth+2 {
-		runes = runes[:dividerWidth+2]
+	// Strip ANSI codes before measuring so invisible escape bytes don't count.
+	ansiStripRe := regexp.MustCompile(`\033\[[0-9;]*m`)
+	visible := []rune(ansiStripRe.ReplaceAllString(line, ""))
+	if len(visible) > dividerWidth+2 {
+		// Rebuild line truncated to fit: strip then re-add colours is complex,
+		// so just reuse the plain clamped visible text when overflow occurs.
+		line = string(visible[:dividerWidth+2])
 	}
-	fmt.Fprintf(os.Stderr, "\r\033[2K%s", string(runes))
+	fmt.Fprintf(os.Stderr, "\r\033[2K%s", line)
 }
 
 func (p *installProgress) Write(b []byte) (int, error) {

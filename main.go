@@ -5,10 +5,11 @@
 package main
 
 import (
-	"bufio"
+	"compress/bzip2"
 	"compress/gzip"
 	"encoding/gob"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -246,6 +247,14 @@ func resolveTemplate(raw string) string {
 		return ""
 	}
 
+	// {{ux|lang|usage example}}, {{usex|lang|text}}, {{uxi|lang|text}} — usage example templates
+	if name == "ux" || name == "usex" || name == "uxi" {
+		if len(parts) >= 3 {
+			return strings.TrimSpace(parts[2])
+		}
+		return ""
+	}
+
 	// Single-argument templates not otherwise handled: return the argument as-is
 	// Covers things like {{lang|word}}, {{smallcaps|word}}, etc.
 	if len(parts) == 2 {
@@ -403,141 +412,267 @@ func lookupEN(word string) *LexEntry {
 	return enProvider.Lookup(word)
 }
 
-// ── Kaikki JSONL types (used by 'lexify install') ─────────────────────────────
+// ── Wiktionary XML types (used by 'lexify -i') ───────────────────────────────
 
-// kEntry mirrors the Kaikki JSONL schema for stream-parsing.
-type kEntry struct {
-	Word   string `json:"word"`
-	POS    string `json:"pos"`
-	Sounds []struct {
-		IPA  string   `json:"ipa"`
-		Tags []string `json:"tags"`
-	} `json:"sounds"`
-	Senses []struct {
-		Glosses  []string `json:"glosses"`
-		Examples []struct {
-			Text string `json:"text"`
-		} `json:"examples"`
-		Synonyms []struct {
-			Word string `json:"word"`
-		} `json:"synonyms"`
-	} `json:"senses"`
-	Synonyms []struct {
-		Word string `json:"word"`
-	} `json:"synonyms"`
-	EtymologyText string `json:"etymology_text"`
-	LangCode      string `json:"lang_code"`
+// langNames maps BCP-47 codes to their English-language names as used in
+// Wiktionary level-2 section headings (== English ==, == Russian ==, etc.).
+var langNames = map[string]string{
+	"en": "English",
+	"de": "German", "fr": "French", "es": "Spanish", "it": "Italian",
+	"pt": "Portuguese", "ru": "Russian", "ja": "Japanese", "zh": "Chinese",
+	"ko": "Korean", "nl": "Dutch", "pl": "Polish", "sv": "Swedish",
+	"ar": "Arabic", "tr": "Turkish", "uk": "Ukrainian", "hi": "Hindi",
 }
 
-func convertKEntry(k kEntry) (string, LexEntry) {
-	key := strings.ToLower(strings.TrimSpace(k.Word))
-	ipa := ""
-	for _, s := range k.Sounds {
-		if strings.HasPrefix(s.IPA, "/") || strings.HasPrefix(s.IPA, "[") {
-			ipa = s.IPA
-			break
-		}
-	}
-	if ipa == "" && len(k.Sounds) > 0 {
-		ipa = k.Sounds[0].IPA
-	}
-	pos := strings.TrimSpace(k.POS)
-	var defs []Def
-	seenSyn := map[string]bool{}
-	var senseSyns []string
-	for _, s := range k.Senses {
-		if len(s.Glosses) == 0 {
+// wiktionaryDumpURL returns the en.wiktionary.org XML dump URL.
+// The dump is bzip2-compressed MediaWiki XML and contains entries for all
+// languages in the same wikitext format our live-API parser already handles.
+func wiktionaryDumpURL() string {
+	return "https://dumps.wikimedia.org/enwiktionary/latest/enwiktionary-latest-pages-articles.xml.bz2"
+}
+
+// xmlPage is used to stream-decode pages from a MediaWiki XML dump.
+type xmlPage struct {
+	Title    string `xml:"title"`
+	NS       int    `xml:"ns"`
+	Revision struct {
+		Text string `xml:"text"`
+	} `xml:"revision"`
+}
+
+// posSections is the set of Wiktionary section headings (lowercased) that
+// represent a part-of-speech and contain numbered definitions.
+var posSections = map[string]bool{
+	"noun": true, "verb": true, "adjective": true, "adverb": true,
+	"pronoun": true, "preposition": true, "conjunction": true,
+	"interjection": true, "determiner": true, "article": true,
+	"numeral": true, "particle": true, "phrase": true,
+	"suffix": true, "prefix": true, "affix": true,
+	"proper noun": true, "proverb": true, "idiom": true,
+}
+
+// ipaExtractRe matches the first IPA argument from {{IPA|lang|/…/|…}}.
+var ipaExtractRe = regexp.MustCompile(`\{\{IPA\|[^|{}]+\|([^|{}]+)`)
+
+// extractL2Section returns the wikitext between the == sectionName == heading
+// (case-insensitive) and the next level-2 heading.
+func extractL2Section(wikitext, sectionName string) string {
+	lines := strings.Split(wikitext, "\n")
+	var result []string
+	inSection := false
+	for _, line := range lines {
+		level, heading := parseWikiHeading(line)
+		if level == 2 {
+			if inSection {
+				break
+			}
+			if strings.EqualFold(heading, sectionName) {
+				inSection = true
+			}
 			continue
 		}
-		example := ""
-		if len(s.Examples) > 0 {
-			ex := []rune(strings.TrimSpace(s.Examples[0].Text))
-			if len(ex) > 150 {
-				// back up to last space so we don't cut mid-word
+		if inSection {
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n")
+}
+
+// appendUniq appends elements from src to dst, skipping duplicates.
+func appendUniq(dst []string, src ...string) []string {
+	seen := make(map[string]bool, len(dst))
+	for _, v := range dst {
+		seen[v] = true
+	}
+	for _, v := range src {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			dst = append(dst, v)
+		}
+	}
+	return dst
+}
+
+// trimEtym caps etymology text at 500 runes at a sentence boundary.
+func trimEtym(etym string) string {
+	r := []rune(etym)
+	if len(r) <= 500 {
+		return etym
+	}
+	cut := -1
+	for i := 499; i >= 0; i-- {
+		if r[i] == '.' || r[i] == '!' || r[i] == '?' {
+			if i+1 == len(r) || r[i+1] == ' ' {
+				cut = i + 1
+				break
+			}
+		}
+	}
+	if cut > 0 {
+		return strings.TrimSpace(string(r[:cut])) + "…"
+	}
+	i := 497
+	for i > 0 && r[i] != ' ' {
+		i--
+	}
+	if i == 0 {
+		i = 497
+	}
+	return string(r[:i]) + "…"
+}
+
+// parsePOSSection extracts up to 3 definitions (with first usage example each)
+// from a Wiktionary POS section's wikitext. Returns nil if no definitions found.
+func parsePOSSection(pos, text string) *Meaning {
+	var defs []Def
+	var pendingText string
+	var pendingEx string
+	flush := func() {
+		if pendingText != "" {
+			defs = append(defs, Def{Text: pendingText, Example: pendingEx})
+			pendingText = ""
+			pendingEx = ""
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if len(defs) >= 3 {
+			break
+		}
+		switch {
+		// Top-level definition: starts with '# ' (not '## ' subsense)
+		case strings.HasPrefix(line, "# "):
+			flush()
+			pendingText = strings.TrimSpace(stripWikitext(strings.TrimPrefix(line, "# ")))
+		// Usage example: starts with '#:' — take first one per definition
+		case strings.HasPrefix(line, "#:") && pendingText != "" && pendingEx == "":
+			raw := strings.TrimSpace(strings.TrimPrefix(line, "#:"))
+			ex := strings.TrimSpace(stripWikitext(raw))
+			r := []rune(ex)
+			if len(r) >= 2 && len(r) <= 150 {
+				pendingEx = ex
+			} else if len(r) > 150 {
 				i := 147
-				for i > 0 && ex[i] != ' ' {
+				for i > 0 && r[i] != ' ' {
 					i--
 				}
 				if i == 0 {
 					i = 147
 				}
-				ex = append(ex[:i], '…')
-			}
-			example = string(ex)
-		}
-		defs = append(defs, Def{Text: s.Glosses[0], Example: example})
-		for _, syn := range s.Synonyms {
-			w := strings.TrimSpace(syn.Word)
-			if w != "" && !seenSyn[w] {
-				seenSyn[w] = true
-				senseSyns = append(senseSyns, w)
+				pendingEx = string(append(r[:i], '…'))
 			}
 		}
 	}
-	for _, syn := range k.Synonyms {
-		w := strings.TrimSpace(syn.Word)
-		if w != "" && !seenSyn[w] {
-			seenSyn[w] = true
-			senseSyns = append(senseSyns, w)
-		}
+	flush()
+	if len(defs) == 0 {
+		return nil
 	}
-	var meanings []Meaning
-	if pos != "" && len(defs) > 0 {
-		meanings = append(meanings, Meaning{POS: pos, Defs: defs, Syns: senseSyns})
-	}
-	etymRunes := []rune(strings.TrimSpace(k.EtymologyText))
-	etym := ""
-	if len(etymRunes) <= 500 {
-		etym = string(etymRunes)
-	} else {
-		// Cut at last sentence boundary before 500 runes.
-		cut := -1
-		for i := 499; i >= 0; i-- {
-			r := etymRunes[i]
-			if r == '.' || r == '!' || r == '?' {
-				if i+1 == len(etymRunes) || etymRunes[i+1] == ' ' {
-					cut = i + 1
-					break
-				}
+	// Collect sense-level synonyms from {{syn|lang|word1|word2|…}} templates.
+	synRe := regexp.MustCompile(`\{\{syn\|[^|{}]+\|([^{}]+)\}\}`)
+	seen := map[string]bool{}
+	var syns []string
+	for _, sm := range synRe.FindAllStringSubmatch(text, -1) {
+		for _, w := range strings.Split(sm[1], "|") {
+			w = strings.TrimSpace(w)
+			if w != "" && !strings.Contains(w, "=") && !seen[w] {
+				seen[w] = true
+				syns = append(syns, w)
 			}
 		}
-		if cut > 0 {
-			etym = strings.TrimSpace(string(etymRunes[:cut])) + "…"
-		} else {
-			// No sentence boundary found — fall back to word boundary.
-			i := 497
-			for i > 0 && etymRunes[i] != ' ' {
-				i--
-			}
-			if i == 0 {
-				i = 497
-			}
-			etym = string(etymRunes[:i]) + "…"
-		}
 	}
-	return key, LexEntry{IPA: ipa, Meanings: meanings, Syns: senseSyns, Etym: etym}
+	return &Meaning{POS: pos, Defs: defs, Syns: syns}
 }
 
-func mergeEntry(existing, incoming LexEntry) LexEntry {
-	existing.Meanings = append(existing.Meanings, incoming.Meanings...)
+// parseSynSection extracts synonym words from a Wiktionary Synonyms section.
+func parseSynSection(text string) []string {
+	stripped := stripWikitext(text)
 	seen := map[string]bool{}
-	for _, s := range existing.Syns {
-		seen[s] = true
-	}
-	for _, s := range incoming.Syns {
-		if !seen[s] {
-			seen[s] = true
-			existing.Syns = append(existing.Syns, s)
+	var result []string
+	for _, line := range strings.Split(stripped, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		for _, w := range regexp.MustCompile(`[,;]+`).Split(line, -1) {
+			w = strings.TrimSpace(w)
+			r := []rune(w)
+			if len(r) < 2 || len(r) > 40 {
+				continue
+			}
+			if unicode.IsUpper(r[0]) {
+				continue
+			}
+			if !seen[w] {
+				seen[w] = true
+				result = append(result, w)
+			}
+			if len(result) >= 10 {
+				return result
+			}
 		}
 	}
-	if existing.IPA == "" {
-		existing.IPA = incoming.IPA
-	}
-	if existing.Etym == "" {
-		existing.Etym = incoming.Etym
-	}
-	return existing
+	return result
 }
+
+// parseWiktionaryPage extracts a LexEntry from a Wiktionary page's wikitext.
+// langSection is the English-language name of the section to extract
+// (e.g. "English", "Russian"). Returns false if the section is absent.
+func parseWiktionaryPage(wikitext, langSection string) (LexEntry, bool) {
+	langText := extractL2Section(wikitext, langSection)
+	if langText == "" {
+		return LexEntry{}, false
+	}
+	var (
+		ipa      string
+		meanings []Meaning
+		etym     string
+		allSyns  []string
+	)
+	var curHeading string
+	var curLines []string
+	flush := func() {
+		if curHeading == "" {
+			return
+		}
+		text := strings.Join(curLines, "\n")
+		lower := strings.ToLower(strings.TrimSpace(curHeading))
+		switch {
+		case lower == "pronunciation":
+			if m := ipaExtractRe.FindStringSubmatch(text); m != nil {
+				ipa = strings.TrimSpace(m[1])
+			}
+		case lower == "etymology" || strings.HasPrefix(lower, "etymology "):
+			etym = trimEtym(stripWikitext(text))
+		case posSections[lower]:
+			if m := parsePOSSection(curHeading, text); m != nil {
+				meanings = append(meanings, *m)
+				allSyns = appendUniq(allSyns, m.Syns...)
+			}
+		case lower == "synonyms":
+			syns := parseSynSection(text)
+			if len(meanings) > 0 {
+				meanings[len(meanings)-1].Syns = appendUniq(meanings[len(meanings)-1].Syns, syns...)
+			}
+			allSyns = appendUniq(allSyns, syns...)
+		}
+		curLines = nil
+	}
+	for _, line := range strings.Split(langText, "\n") {
+		level, heading := parseWikiHeading(line)
+		if level >= 3 {
+			flush()
+			curHeading = heading
+		} else {
+			curLines = append(curLines, line)
+		}
+	}
+	flush()
+	if len(meanings) == 0 && ipa == "" && etym == "" {
+		return LexEntry{}, false
+	}
+	return LexEntry{IPA: ipa, Meanings: meanings, Syns: allSyns, Etym: etym}, true
+}
+
+
 
 // ── Fetchers ──────────────────────────────────────────────────────────────────
 
@@ -993,8 +1128,9 @@ func printHelp() {
 	fmt.Printf("  %slexify%s %s<word>%s %s<lang> <lang>%s %s...%s\n\n", CPos, R, CSyn, R, CTrans, R, CEx, R)
 
 	fmt.Printf("  %s%sFLAGS%s\n", CHead, Bold, R)
-	fmt.Printf("  %s-o%s  use offline XDG pack (requires: lexify install <lang>)\n", CPos, R)
-	fmt.Printf("  %s-d%s  show per-fetch debug timing\n\n", CPos, R)
+	fmt.Printf("  %s-i <lang>%s  install offline pack for <lang>  (e.g. lexify -i en)\n", CPos, R)
+	fmt.Printf("  %s-o%s         use installed offline pack\n", CPos, R)
+	fmt.Printf("  %s-d%s         show per-fetch debug timing\n\n", CPos, R)
 
 	fmt.Printf("  %s%sEXAMPLES%s\n", CHead, Bold, R)
 	examples := [][2]string{
@@ -1014,9 +1150,9 @@ func printHelp() {
 
 	fmt.Printf("  %s%sDATA SOURCES%s\n", CHead, Bold, R)
 	sources := [][2]string{
-		{IDef + "Definition", "kaikki.org / wiktextract  ·  embedded (offline, EN)  ·  dictionaryapi.dev fallback"},
-		{ISyn + "Synonyms", "kaikki.org / wiktextract  ·  embedded (offline, EN)  ·  Wiktionary (target langs)"},
-		{IEty + "Etymology", "kaikki.org / wiktextract  ·  embedded (offline, EN)"},
+		{IDef + "Definition", "en.wiktionary.org (offline pack)  ·  dictionaryapi.dev (live API)"},
+		{ISyn + "Synonyms", "en.wiktionary.org (offline pack)  ·  Wiktionary API (target langs, live)"},
+		{IEty + "Etymology", "en.wiktionary.org (offline pack)  ·  Wiktionary API (live)"},
 		{ITrans + "Translation", "Google Translate gtx  ·  MyMemory fallback  (no key)"},
 	}
 	for _, s := range sources {
@@ -1299,27 +1435,14 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	})
 }
 
-// ── Install subcommand ──────────────────────────────────────────────────────────────
-
-var kaikkiLangNames = map[string]string{
-	"de": "German", "fr": "French", "es": "Spanish", "it": "Italian",
-	"pt": "Portuguese", "ru": "Russian", "ja": "Japanese", "zh": "Chinese",
-	"ko": "Korean", "nl": "Dutch", "pl": "Polish", "sv": "Swedish",
-	"ar": "Arabic", "tr": "Turkish", "uk": "Ukrainian", "hi": "Hindi",
-}
-
-func kaikkiURL(lang string) (string, error) {
-	if lang == "en" {
-		return "https://kaikki.org/dictionary/English/kaikki.org-dictionary-English.jsonl", nil
-	}
-	name, ok := kaikkiLangNames[lang]
-	if !ok {
-		return "", fmt.Errorf("no kaikki.org pack available for %q", lang)
-	}
-	return fmt.Sprintf("https://kaikki.org/dictionary/%s/kaikki.org-dictionary-%s.jsonl", name, name), nil
-}
+// ── Install subcommand  (-i / --install) ────────────────────────────────────────────────────────
 
 func cmdInstall(lang string) {
+	langName, ok := langNames[lang]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "lexify -i: unsupported language %q\n  supported: en de fr es it pt ru ja zh ko nl pl sv ar tr uk hi\n", lang)
+		os.Exit(1)
+	}
 	// newBar returns a progressbar writing to stderr.
 	// max=-1 → indeterminate (spinner + byte counter); max>0 → percentage bar.
 	// Descriptions must be plain text — ANSI codes break the library's width math.
@@ -1343,36 +1466,32 @@ func cmdInstall(lang string) {
 		return progressbar.NewOptions64(max, opts...)
 	}
 
-	dlURL, err := kaikkiURL(lang)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "lexify install: "+err.Error())
-		os.Exit(1)
-	}
+	dlURL := wiktionaryDumpURL()
 	dataDir := xdgDataDir()
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: mkdir %s: %v\n", dataDir, err)
+		fmt.Fprintf(os.Stderr, "lexify -i: mkdir %s: %v\n", dataDir, err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("\n  installing %s%s%s language pack\n\n", Bold, strings.ToUpper(lang), R)
+	fmt.Printf("\n  installing %s%s%s language pack (en.wiktionary.org)\n\n", Bold, strings.ToUpper(lang), R)
 
-	// ── Step 1: download JSONL ─────────────────────────────────────────
-	jsonlTmp := filepath.Join(dataDir, lang+".jsonl.tmp")
-	defer os.Remove(jsonlTmp)
+	// ── Step 1: download XML dump (bzip2-compressed) ────────────────────
+	xmlTmp := filepath.Join(dataDir, lang+".xml.bz2.tmp")
+	defer os.Remove(xmlTmp)
 
 	resp, err := http.Get(dlURL) //nolint:gosec
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: download: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: download: %v\n", err)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		fmt.Fprintf(os.Stderr, "lexify install: HTTP %d\n", resp.StatusCode)
+		fmt.Fprintf(os.Stderr, "lexify -i: HTTP %d\n", resp.StatusCode)
 		os.Exit(1)
 	}
-	f, err := os.Create(jsonlTmp)
+	f, err := os.Create(xmlTmp)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: create temp: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: create temp: %v\n", err)
 		os.Exit(1)
 	}
 	dlBar := newBar(resp.ContentLength, "downloading")
@@ -1380,39 +1499,49 @@ func cmdInstall(lang string) {
 	f.Close()
 	_ = dlBar.Finish()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: download: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: download: %v\n", err)
 		os.Exit(1)
 	}
 	fileSize := n
 
-	// ── Step 2: stream-parse JSONL ────────────────────────────────────
+	// ── Step 2: stream-parse XML via bzip2 decompressor ───────────────
 	t0 := time.Now()
-	rdr, err := os.Open(jsonlTmp)
+	rdr, err := os.Open(xmlTmp)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: open: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: open: %v\n", err)
 		os.Exit(1)
 	}
 	parseBar := newBar(fileSize, "parsing")
 	parseRdr := progressbar.NewReader(rdr, parseBar)
-	index := make(map[string]LexEntry, 1_000_000)
-	scanner := bufio.NewScanner(&parseRdr)
-	scanner.Buffer(make([]byte, 4<<20), 4<<20)
+	bzRdr := bzip2.NewReader(&parseRdr)
+	index := make(map[string]LexEntry, 500_000)
+	decoder := xml.NewDecoder(bzRdr)
 	var total int
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break // EOF or unrecoverable parse error
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != "page" {
 			continue
 		}
-		var k kEntry
-		if json.Unmarshal(line, &k) != nil || k.LangCode != lang || strings.TrimSpace(k.Word) == "" {
+		var p xmlPage
+		if err := decoder.DecodeElement(&p, &se); err != nil {
 			continue
 		}
-		key, entry := convertKEntry(k)
-		if existing, ok := index[key]; ok {
-			index[key] = mergeEntry(existing, entry)
-		} else {
-			index[key] = entry
+		if p.NS != 0 {
+			continue // skip Talk, User, Template, etc.
 		}
+		title := strings.TrimSpace(p.Title)
+		if title == "" || strings.ContainsAny(title, ":/") {
+			continue // skip namespace-prefixed pages
+		}
+		entry, ok := parseWiktionaryPage(p.Revision.Text, langName)
+		if !ok {
+			continue
+		}
+		index[strings.ToLower(title)] = entry
 		total++
 	}
 	rdr.Close()
@@ -1425,21 +1554,21 @@ func cmdInstall(lang string) {
 	binPath := filepath.Join(dataDir, lang+".bin.gz")
 	out, err := os.Create(binPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: create bin: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: create bin: %v\n", err)
 		os.Exit(1)
 	}
 	defer out.Close()
 	gw, err := gzip.NewWriterLevel(out, gzip.BestCompression)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: gzip: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: gzip: %v\n", err)
 		os.Exit(1)
 	}
 	if err := gob.NewEncoder(gw).Encode(index); err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: encode: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: encode: %v\n", err)
 		os.Exit(1)
 	}
 	if err := gw.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "lexify install: gzip close: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: gzip close: %v\n", err)
 		os.Exit(1)
 	}
 	_ = packBar.Finish()
@@ -1462,13 +1591,17 @@ func main() {
 		printHelp()
 		return
 	}
-	if os.Args[1] == "install" {
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: lexify install <lang>")
-			os.Exit(1)
+	// Check for -i/--install flag anywhere in args (e.g. lexify -i en, lexify --install ru)
+	args := os.Args[1:]
+	for j, a := range args {
+		if a == "-i" || a == "--install" {
+			if j+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "usage: lexify -i <lang>")
+				os.Exit(1)
+			}
+			cmdInstall(strings.ToLower(strings.TrimSpace(args[j+1])))
+			return
 		}
-		cmdInstall(strings.ToLower(strings.TrimSpace(os.Args[2])))
-		return
 	}
 	word := strings.TrimSpace(os.Args[1])
 	debug := false

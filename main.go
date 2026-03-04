@@ -5,8 +5,10 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"compress/bzip2"
-	"compress/gzip"
+	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
 	"encoding/xml"
@@ -17,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -361,33 +364,85 @@ func xdgDataDir() string {
 }
 
 // installedPack is the LookupProvider backed by a user-installed pack on disk.
+// Pack format (written by cmdInstall):
+//
+//	lang.idx — sorted fixed-size records: [32-byte key, zero-padded][8-byte offset, big-endian]
+//	lang.dat — sequential entries:        [4-byte length, big-endian][gob-encoded LexEntry bytes]
+//
+// Lookup is O(log n) binary search over the in-memory index (~32 MB for EN)
+// + one file seek + decode of a single gob entry. Total: ~30 ms cold, ~1 ms warm.
 type installedPack struct {
-	path string
-	once sync.Once
-	data map[string]LexEntry
+	idxPath string
+	datPath string
+	once    sync.Once
+	idxData []byte // full .idx loaded once; 40 bytes × N entries
 }
+
+const idxRecordSize = 40 // 32-byte key + 8-byte offset
+const idxKeySize = 32
 
 func (p *installedPack) init() {
 	p.once.Do(func() {
-		f, err := os.Open(p.path)
-		if err != nil {
+		data, err := os.ReadFile(p.idxPath)
+		if err != nil || len(data)%idxRecordSize != 0 {
 			return
 		}
-		defer f.Close()
-		gr, err := gzip.NewReader(f)
-		if err != nil {
-			return
-		}
-		defer gr.Close()
-		p.data = make(map[string]LexEntry)
-		gob.NewDecoder(gr).Decode(&p.data) //nolint
+		p.idxData = data
 	})
 }
 
 func (p *installedPack) Lookup(word string) *LexEntry {
 	p.init()
-	if e, ok := p.data[strings.ToLower(word)]; ok {
-		return &e
+	if len(p.idxData) == 0 {
+		return nil
+	}
+	key := []byte(strings.ToLower(word))
+	if len(key) > idxKeySize {
+		return nil // key too long to be in index
+	}
+	var keyBuf [idxKeySize]byte
+	copy(keyBuf[:], key)
+
+	// Binary search over fixed-size records.
+	n := len(p.idxData) / idxRecordSize
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		rec := p.idxData[mid*idxRecordSize : mid*idxRecordSize+idxRecordSize]
+		cmp := bytes.Compare(keyBuf[:], rec[:idxKeySize])
+		switch {
+		case cmp == 0:
+			offset := binary.BigEndian.Uint64(rec[idxKeySize : idxKeySize+8])
+			f, err := os.Open(p.datPath)
+			if err != nil {
+				return nil
+			}
+			defer f.Close()
+			if _, err := f.Seek(int64(offset), io.SeekStart); err != nil {
+				return nil
+			}
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+				return nil
+			}
+			entryLen := binary.BigEndian.Uint32(lenBuf[:])
+			if entryLen == 0 || entryLen > 1<<20 {
+				return nil
+			}
+			entryBytes := make([]byte, entryLen)
+			if _, err := io.ReadFull(f, entryBytes); err != nil {
+				return nil
+			}
+			var e LexEntry
+			if err := gob.NewDecoder(bytes.NewReader(entryBytes)).Decode(&e); err != nil {
+				return nil
+			}
+			return &e
+		case cmp < 0:
+			hi = mid
+		default:
+			lo = mid + 1
+		}
 	}
 	return nil
 }
@@ -396,9 +451,10 @@ func (p *installedPack) Lookup(word string) *LexEntry {
 // nil when no pack is installed; lookupEN returns nil in that case and run() falls
 // back to the dictionaryapi.dev network API.
 var enProvider, usingInstalledPack = func() (LookupProvider, bool) {
-	xdgPath := filepath.Join(xdgDataDir(), "en.bin.gz")
-	if _, err := os.Stat(xdgPath); err == nil {
-		p := &installedPack{path: xdgPath}
+	idxPath := filepath.Join(xdgDataDir(), "en.idx")
+	datPath := filepath.Join(xdgDataDir(), "en.dat")
+	if _, err := os.Stat(idxPath); err == nil {
+		p := &installedPack{idxPath: idxPath, datPath: datPath}
 		go p.init()
 		return p, true
 	}
@@ -670,6 +726,117 @@ func parseWiktionaryPage(wikitext, langSection string) (LexEntry, bool) {
 		return LexEntry{}, false
 	}
 	return LexEntry{IPA: ipa, Meanings: meanings, Syns: allSyns, Etym: etym}, true
+}
+
+// ── Kaikki JSONL types (used by 'lexify -i --kaikki') ──────────────────────
+
+// kEntry mirrors the Kaikki JSONL schema for stream-parsing.
+type kEntry struct {
+	Word   string `json:"word"`
+	POS    string `json:"pos"`
+	Sounds []struct {
+		IPA  string   `json:"ipa"`
+		Tags []string `json:"tags"`
+	} `json:"sounds"`
+	Senses []struct {
+		Glosses  []string `json:"glosses"`
+		Examples []struct {
+			Text string `json:"text"`
+		} `json:"examples"`
+		Synonyms []struct {
+			Word string `json:"word"`
+		} `json:"synonyms"`
+	} `json:"senses"`
+	Synonyms []struct {
+		Word string `json:"word"`
+	} `json:"synonyms"`
+	EtymologyText string `json:"etymology_text"`
+	LangCode      string `json:"lang_code"`
+}
+
+// kaikkiURL returns the Kaikki.org JSONL download URL for the given language.
+func kaikkiURL(langName string) string {
+	return fmt.Sprintf("https://kaikki.org/dictionary/%s/kaikki.org-dictionary-%s.jsonl", langName, langName)
+}
+
+// convertKEntry converts a raw Kaikki entry to a LexEntry.
+// Glosses and etymology are run through stripWikitext to clean light markup.
+func convertKEntry(k kEntry) (string, LexEntry) {
+	key := strings.ToLower(strings.TrimSpace(k.Word))
+	ipa := ""
+	for _, s := range k.Sounds {
+		if strings.HasPrefix(s.IPA, "/") || strings.HasPrefix(s.IPA, "[") {
+			ipa = s.IPA
+			break
+		}
+	}
+	if ipa == "" && len(k.Sounds) > 0 {
+		ipa = k.Sounds[0].IPA
+	}
+	pos := strings.TrimSpace(k.POS)
+	seenSyn := map[string]bool{}
+	var senseSyns []string
+	var defs []Def
+	for _, s := range k.Senses {
+		if len(s.Glosses) == 0 {
+			continue
+		}
+		gloss := strings.TrimSpace(stripWikitext(s.Glosses[0]))
+		if gloss == "" {
+			continue
+		}
+		example := ""
+		if len(s.Examples) > 0 {
+			ex := []rune(strings.TrimSpace(s.Examples[0].Text))
+			if len(ex) > 150 {
+				i := 147
+				for i > 0 && ex[i] != ' ' {
+					i--
+				}
+				if i == 0 {
+					i = 147
+				}
+				ex = append(ex[:i], '…')
+			}
+			if len(ex) >= 2 {
+				example = string(ex)
+			}
+		}
+		defs = append(defs, Def{Text: gloss, Example: example})
+		for _, syn := range s.Synonyms {
+			w := strings.TrimSpace(syn.Word)
+			if w != "" && !seenSyn[w] {
+				seenSyn[w] = true
+				senseSyns = append(senseSyns, w)
+			}
+		}
+	}
+	for _, syn := range k.Synonyms {
+		w := strings.TrimSpace(syn.Word)
+		if w != "" && !seenSyn[w] {
+			seenSyn[w] = true
+			senseSyns = append(senseSyns, w)
+		}
+	}
+	var meanings []Meaning
+	if pos != "" && len(defs) > 0 {
+		meanings = append(meanings, Meaning{POS: pos, Defs: defs, Syns: senseSyns})
+	}
+	etym := trimEtym(stripWikitext(strings.TrimSpace(k.EtymologyText)))
+	return key, LexEntry{IPA: ipa, Meanings: meanings, Syns: senseSyns, Etym: etym}
+}
+
+// mergeKEntry merges an incoming Kaikki entry (separate POS line) into an existing one.
+func mergeKEntry(existing, incoming LexEntry) LexEntry {
+	existing.Meanings = append(existing.Meanings, incoming.Meanings...)
+	existing.Syns = appendUniq(existing.Syns, incoming.Syns...)
+	if existing.IPA == "" {
+		existing.IPA = incoming.IPA
+	}
+	if existing.Etym == "" {
+		existing.Etym = incoming.Etym
+	}
+	return existing
 }
 
 // ── Fetchers ──────────────────────────────────────────────────────────────────
@@ -1126,7 +1293,9 @@ func printHelp() {
 	fmt.Printf("  %slexify%s %s<word>%s %s<lang> <lang>%s %s...%s\n\n", CPos, R, CSyn, R, CTrans, R, CEx, R)
 
 	fmt.Printf("  %s%sFLAGS%s\n", CHead, Bold, R)
-	fmt.Printf("  %s-i <lang>%s  install offline pack for <lang>  (e.g. lexify -i en)\n", CPos, R)
+	fmt.Printf("  %s-i <lang>%s  install offline pack  (e.g. lexify -i en)\n", CPos, R)
+	fmt.Printf("  %s  --kaikki%s  source: kaikki.org JSONL  ~500 MB, ~2 min  %s(default)%s\n", CPos, R, Dim, R)
+	fmt.Printf("  %s  --wiki%s   source: en.wiktionary.org XML dump  ~1.2 GB, ~10 min\n", CPos, R)
 	fmt.Printf("  %s-o%s         use installed offline pack\n", CPos, R)
 	fmt.Printf("  %s-d%s         show per-fetch debug timing\n\n", CPos, R)
 
@@ -1435,15 +1604,14 @@ func run(word string, translateLangs []string, debug, offline bool) {
 
 // ── Install subcommand  (-i / --install) ────────────────────────────────────────────────────────
 
-func cmdInstall(lang string) {
+// cmdInstall downloads and indexes a language pack for offline use.
+// source is "kaikki" (default, fast ~500 MB JSONL) or "wiki" (~1.2 GB XML dump).
+func cmdInstall(lang, source string) {
 	langName, ok := langNames[lang]
 	if !ok {
 		fmt.Fprintf(os.Stderr, "lexify -i: unsupported language %q\n  supported: en de fr es it pt ru ja zh ko nl pl sv ar tr uk hi\n", lang)
 		os.Exit(1)
 	}
-	// newBar returns a progressbar writing to stderr.
-	// max=-1 → indeterminate (spinner + byte counter); max>0 → percentage bar.
-	// Descriptions must be plain text — ANSI codes break the library's width math.
 	newBar := func(max int64, desc string) *progressbar.ProgressBar {
 		opts := []progressbar.Option{
 			progressbar.OptionSetDescription(fmt.Sprintf("  %-13s", desc)),
@@ -1464,17 +1632,28 @@ func cmdInstall(lang string) {
 		return progressbar.NewOptions64(max, opts...)
 	}
 
-	dlURL := wiktionaryDumpURL()
 	dataDir := xdgDataDir()
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "lexify -i: mkdir %s: %v\n", dataDir, err)
 		os.Exit(1)
 	}
 
+	// Determine download URL and temp file extension from source.
+	var dlURL, tmpExt string
+	switch source {
+	case "wiki":
+		dlURL = wiktionaryDumpURL()
+		tmpExt = ".xml.bz2.tmp"
+	default: // "kaikki"
+		source = "kaikki"
+		dlURL = kaikkiURL(langName)
+		tmpExt = ".jsonl.tmp"
+	}
+
 	// ── Up-to-date check: HEAD request → Last-Modified ─────────────────
-	// Compare against the value stored in the existing version file.
-	// If the dump hasn't changed and the pack binary exists, skip entirely.
-	binPath := filepath.Join(dataDir, lang+".bin.gz")
+	// Source URL is embedded in the version file, so switching --kaikki↔--wiki
+	// always triggers a fresh install even if Last-Modified is unchanged.
+	idxPath := filepath.Join(dataDir, lang+".idx")
 	verPath := filepath.Join(dataDir, lang+".version")
 	var remoteLastMod string
 	headResp, headErr := httpClient.Head(dlURL) //nolint:gosec
@@ -1483,8 +1662,10 @@ func cmdInstall(lang string) {
 		remoteLastMod = headResp.Header.Get("Last-Modified")
 		if remoteLastMod != "" {
 			if existing, err := os.ReadFile(verPath); err == nil {
-				if strings.Contains(string(existing), "last-modified: "+remoteLastMod) {
-					if _, err := os.Stat(binPath); err == nil {
+				exStr := string(existing)
+				if strings.Contains(exStr, "source: "+dlURL) &&
+					strings.Contains(exStr, "last-modified: "+remoteLastMod) {
+					if _, err := os.Stat(idxPath); err == nil {
 						fmt.Printf("\n  %s%s%s pack is already up to date (%s).\n\n",
 							Bold+CSyn, strings.ToUpper(lang), R, remoteLastMod)
 						return
@@ -1494,11 +1675,12 @@ func cmdInstall(lang string) {
 		}
 	}
 
-	fmt.Printf("\n  installing %s%s%s language pack (en.wiktionary.org)\n\n", Bold, strings.ToUpper(lang), R)
+	fmt.Printf("\n  installing %s%s%s language pack (source: %s)\n\n",
+		Bold, strings.ToUpper(lang), R, source)
 
-	// ── Step 1: download XML dump (bzip2-compressed) ────────────────────
-	xmlTmp := filepath.Join(dataDir, lang+".xml.bz2.tmp")
-	defer os.Remove(xmlTmp)
+	// ── Step 1: download ─────────────────────────────────────────────────
+	tmpPath := filepath.Join(dataDir, lang+tmpExt)
+	defer os.Remove(tmpPath)
 
 	resp, err := http.Get(dlURL) //nolint:gosec
 	if err != nil {
@@ -1513,7 +1695,7 @@ func cmdInstall(lang string) {
 	if remoteLastMod == "" {
 		remoteLastMod = resp.Header.Get("Last-Modified")
 	}
-	f, err := os.Create(xmlTmp)
+	f, err := os.Create(tmpPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lexify -i: create temp: %v\n", err)
 		os.Exit(1)
@@ -1528,82 +1710,138 @@ func cmdInstall(lang string) {
 	}
 	fileSize := n
 
-	// ── Step 2: stream-parse XML via bzip2 decompressor ───────────────
+	// ── Step 2: parse (branched by source) ──────────────────────────────
 	t0 := time.Now()
-	rdr, err := os.Open(xmlTmp)
+	rdr, err := os.Open(tmpPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lexify -i: open: %v\n", err)
 		os.Exit(1)
 	}
 	parseBar := newBar(fileSize, "parsing")
 	parseRdr := progressbar.NewReader(rdr, parseBar)
-	bzRdr := bzip2.NewReader(&parseRdr)
 	index := make(map[string]LexEntry, 500_000)
-	decoder := xml.NewDecoder(bzRdr)
 	var total int
-	for {
-		tok, err := decoder.Token()
-		if err != nil {
-			break // EOF or unrecoverable parse error
+
+	switch source {
+	case "kaikki":
+		scanner := bufio.NewScanner(&parseRdr)
+		scanner.Buffer(make([]byte, 4<<20), 4<<20)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var k kEntry
+			if json.Unmarshal(line, &k) != nil || k.LangCode != lang || strings.TrimSpace(k.Word) == "" {
+				continue
+			}
+			key, entry := convertKEntry(k)
+			if existing, ok := index[key]; ok {
+				index[key] = mergeKEntry(existing, entry)
+			} else {
+				index[key] = entry
+			}
+			total++
 		}
-		se, ok := tok.(xml.StartElement)
-		if !ok || se.Name.Local != "page" {
-			continue
+	default: // wiki
+		bzRdr := bzip2.NewReader(&parseRdr)
+		decoder := xml.NewDecoder(bzRdr)
+		for {
+			tok, err := decoder.Token()
+			if err != nil {
+				break
+			}
+			se, ok := tok.(xml.StartElement)
+			if !ok || se.Name.Local != "page" {
+				continue
+			}
+			var p xmlPage
+			if err := decoder.DecodeElement(&p, &se); err != nil {
+				continue
+			}
+			if p.NS != 0 {
+				continue
+			}
+			title := strings.TrimSpace(p.Title)
+			if title == "" || strings.ContainsAny(title, ":/") {
+				continue
+			}
+			entry, ok := parseWiktionaryPage(p.Revision.Text, langName)
+			if !ok {
+				continue
+			}
+			index[strings.ToLower(title)] = entry
+			total++
 		}
-		var p xmlPage
-		if err := decoder.DecodeElement(&p, &se); err != nil {
-			continue
-		}
-		if p.NS != 0 {
-			continue // skip Talk, User, Template, etc.
-		}
-		title := strings.TrimSpace(p.Title)
-		if title == "" || strings.ContainsAny(title, ":/") {
-			continue // skip namespace-prefixed pages
-		}
-		entry, ok := parseWiktionaryPage(p.Revision.Text, langName)
-		if !ok {
-			continue
-		}
-		index[strings.ToLower(title)] = entry
-		total++
 	}
 	rdr.Close()
 	_ = parseBar.Finish()
 	fmt.Fprintf(os.Stderr, "  %s%dk words%s indexed in %.1fs\n",
 		Dim, total/1000, R, time.Since(t0).Seconds())
 
-	// ── Step 3: write bin.gz ───────────────────────────────────────────
+	// ── Step 3: write idx + dat pack ─────────────────────────────────────
+	type kv struct {
+		key   string
+		entry LexEntry
+	}
+	entries := make([]kv, 0, len(index))
+	for k, v := range index {
+		if len(k) <= idxKeySize {
+			entries = append(entries, kv{k, v})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+
 	packBar := newBar(-1, "packing")
-	out, err := os.Create(binPath)
+	datPath := filepath.Join(dataDir, lang+".dat")
+	datF, err := os.Create(datPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify -i: create bin: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lexify -i: create dat: %v\n", err)
 		os.Exit(1)
 	}
-	defer out.Close()
-	gw, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+	idxF, err := os.Create(idxPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "lexify -i: gzip: %v\n", err)
+		datF.Close()
+		fmt.Fprintf(os.Stderr, "lexify -i: create idx: %v\n", err)
 		os.Exit(1)
 	}
-	if err := gob.NewEncoder(gw).Encode(index); err != nil {
-		fmt.Fprintf(os.Stderr, "lexify -i: encode: %v\n", err)
-		os.Exit(1)
+	var datOffset uint64
+	idxRecord := make([]byte, idxRecordSize)
+	for _, kv := range entries {
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(kv.entry); err != nil {
+			continue
+		}
+		entryBytes := buf.Bytes()
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(entryBytes)))
+		if _, err := datF.Write(lenBuf[:]); err != nil {
+			break
+		}
+		if _, err := datF.Write(entryBytes); err != nil {
+			break
+		}
+		clear(idxRecord)
+		copy(idxRecord[:idxKeySize], []byte(kv.key))
+		binary.BigEndian.PutUint64(idxRecord[idxKeySize:], datOffset)
+		if _, err := idxF.Write(idxRecord); err != nil {
+			break
+		}
+		datOffset += uint64(4 + len(entryBytes))
 	}
-	if err := gw.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "lexify -i: gzip close: %v\n", err)
-		os.Exit(1)
-	}
+	datF.Close()
+	idxF.Close()
 	_ = packBar.Finish()
-	stat, _ := out.Stat()
-	fmt.Fprintf(os.Stderr, "  %s%.1f MB%s written  →  %s\n",
-		Dim, float64(stat.Size())/(1024*1024), R, binPath)
+	if st, err := os.Stat(datPath); err == nil {
+		fmt.Fprintf(os.Stderr, "  %s%.1f MB%s written  →  %s\n",
+			Dim, float64(st.Size())/(1024*1024), R, datPath)
+	}
 
 	// ── Version file ────────────────────────────────────────────────────
 	ver := fmt.Sprintf("source: %s\nbuilt:  %s\nlast-modified: %s\n", dlURL, time.Now().Format(time.RFC3339), remoteLastMod)
 	os.WriteFile(verPath, []byte(ver), 0o644) //nolint
 
-	fmt.Printf("\n  %s%s pack installed.%s  run 'lexify <word>' to use it.\n\n",
+	fmt.Printf("\n  %s%s pack installed.%s  run 'lexify <word> -o' to use it.\n\n",
 		Bold+CSyn, strings.ToUpper(lang), R)
 }
 
@@ -1614,15 +1852,24 @@ func main() {
 		printHelp()
 		return
 	}
-	// Check for -i/--install flag anywhere in args (e.g. lexify -i en, lexify --install ru)
+	// Check for -i/--install flag anywhere in args (e.g. lexify -i en, lexify -i en --wiki)
 	args := os.Args[1:]
 	for j, a := range args {
 		if a == "-i" || a == "--install" {
 			if j+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "usage: lexify -i <lang>")
+				fmt.Fprintln(os.Stderr, "usage: lexify -i <lang> [--kaikki|--wiki]")
 				os.Exit(1)
 			}
-			cmdInstall(strings.ToLower(strings.TrimSpace(args[j+1])))
+			lang := strings.ToLower(strings.TrimSpace(args[j+1]))
+			source := "kaikki" // default: fast ~500MB JSONL
+			for _, flag := range args[j+2:] {
+				if flag == "--kaikki" {
+					source = "kaikki"
+				} else if flag == "--wiki" {
+					source = "wiki"
+				}
+			}
+			cmdInstall(lang, source)
 			return
 		}
 	}

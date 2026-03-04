@@ -1471,6 +1471,29 @@ func cmdInstall(lang string) {
 		os.Exit(1)
 	}
 
+	// ── Up-to-date check: HEAD request → Last-Modified ─────────────────
+	// Compare against the value stored in the existing version file.
+	// If the dump hasn't changed and the pack binary exists, skip entirely.
+	binPath := filepath.Join(dataDir, lang+".bin.gz")
+	verPath := filepath.Join(dataDir, lang+".version")
+	var remoteLastMod string
+	headResp, headErr := httpClient.Head(dlURL) //nolint:gosec
+	if headErr == nil {
+		headResp.Body.Close()
+		remoteLastMod = headResp.Header.Get("Last-Modified")
+		if remoteLastMod != "" {
+			if existing, err := os.ReadFile(verPath); err == nil {
+				if strings.Contains(string(existing), "last-modified: "+remoteLastMod) {
+					if _, err := os.Stat(binPath); err == nil {
+						fmt.Printf("\n  %s%s%s pack is already up to date (%s).\n\n",
+							Bold+CSyn, strings.ToUpper(lang), R, remoteLastMod)
+						return
+					}
+				}
+			}
+		}
+	}
+
 	fmt.Printf("\n  installing %s%s%s language pack (en.wiktionary.org)\n\n", Bold, strings.ToUpper(lang), R)
 
 	// ── Step 1: download XML dump (bzip2-compressed) ────────────────────
@@ -1486,6 +1509,9 @@ func cmdInstall(lang string) {
 	if resp.StatusCode != 200 {
 		fmt.Fprintf(os.Stderr, "lexify -i: HTTP %d\n", resp.StatusCode)
 		os.Exit(1)
+	}
+	if remoteLastMod == "" {
+		remoteLastMod = resp.Header.Get("Last-Modified")
 	}
 	f, err := os.Create(xmlTmp)
 	if err != nil {
@@ -1549,7 +1575,6 @@ func cmdInstall(lang string) {
 
 	// ── Step 3: write bin.gz ───────────────────────────────────────────
 	packBar := newBar(-1, "packing")
-	binPath := filepath.Join(dataDir, lang+".bin.gz")
 	out, err := os.Create(binPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lexify -i: create bin: %v\n", err)
@@ -1575,8 +1600,8 @@ func cmdInstall(lang string) {
 		Dim, float64(stat.Size())/(1024*1024), R, binPath)
 
 	// ── Version file ────────────────────────────────────────────────────
-	ver := fmt.Sprintf("source: %s\nbuilt:  %s\n", dlURL, time.Now().Format(time.RFC3339))
-	os.WriteFile(filepath.Join(dataDir, lang+".version"), []byte(ver), 0o644) //nolint
+	ver := fmt.Sprintf("source: %s\nbuilt:  %s\nlast-modified: %s\n", dlURL, time.Now().Format(time.RFC3339), remoteLastMod)
+	os.WriteFile(verPath, []byte(ver), 0o644) //nolint
 
 	fmt.Printf("\n  %s%s pack installed.%s  run 'lexify <word>' to use it.\n\n",
 		Bold+CSyn, strings.ToUpper(lang), R)

@@ -822,7 +822,6 @@ type RenderInput struct {
 	Warnings       []string
 	Elapsed        time.Duration
 	FetchLog       []string // per-fetch timing lines
-	Hint           string   // shown at bottom when offline data is unavailable
 }
 
 func render(in RenderInput) {
@@ -965,9 +964,6 @@ func render(in RenderInput) {
 			fmt.Printf("  %s%s%s\n", Dim, line, R)
 		}
 	}
-	if in.Hint != "" {
-		fmt.Printf("  %s→ %s%s\n", Dim, in.Hint, R)
-	}
 	fmt.Println(divider())
 	fmt.Println()
 }
@@ -1081,6 +1077,15 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		apiEtym string
 	)
 
+	// synTargets and wg2 are declared here so trans goroutines can chain
+	// syns lookups immediately after the translation result arrives,
+	// overlapping with defn/etym fetches in Phase 1.
+	var (
+		synTargets  = make([][]string, len(translateLangs))
+		tSynTargets = make([]time.Duration, len(translateLangs))
+	)
+	var wg2 sync.WaitGroup
+
 	var wg1 sync.WaitGroup
 	wg1.Add(len(translateLangs))
 	if offline {
@@ -1115,6 +1120,16 @@ func run(word string, translateLangs []string, debug, offline bool) {
 			t := time.Now()
 			wordTrans[i] = fetchTranslation(word, lang)
 			tWordTrans[i] = time.Since(t)
+			// Fire target-language syns immediately — overlaps with defn/etym.
+			if wordTrans[i] != nil && wordTrans[i].Word != "" {
+				wg2.Add(1)
+				go func() {
+					defer wg2.Done()
+					t2 := time.Now()
+					synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
+					tSynTargets[i] = time.Since(t2)
+				}()
+			}
 		}()
 	}
 	wg1.Wait()
@@ -1158,7 +1173,10 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	}
 
 	// ── Validate languages: drop any whose word translation fully failed ───────
+	// Track original indices so synTargets (filled asynchronously) can be
+	// remapped after wg2.Wait().
 	var warnings []string
+	var validIdx []int
 	{
 		var validLangs []string
 		var validTrans []*Translation
@@ -1166,6 +1184,7 @@ func run(word string, translateLangs []string, debug, offline bool) {
 			if wordTrans[i] == nil {
 				warnings = append(warnings, fmt.Sprintf("language %q not recognised — falling back to English", lang))
 			} else {
+				validIdx = append(validIdx, i)
 				validLangs = append(validLangs, lang)
 				validTrans = append(validTrans, wordTrans[i])
 			}
@@ -1198,28 +1217,15 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	}
 
 	var (
-		synTargets     = make([][]string, len(translateLangs))
 		defnTranslated string
 		etymTranslated string
-		tSynTargets    = make([]time.Duration, len(translateLangs))
 		tDefnTrans     time.Duration
 		tEtymTrans     time.Duration
 	)
 
-	var wg2 sync.WaitGroup
-	wg2.Add(len(translateLangs) + 2)
-
-	for i, lang := range translateLangs {
-		i, lang := i, lang
-		go func() {
-			defer wg2.Done()
-			if wordTrans[i] != nil && wordTrans[i].Word != "" {
-				t := time.Now()
-				synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
-				tSynTargets[i] = time.Since(t)
-			}
-		}()
-	}
+	// Fire defn/etym text translations — these are the only remaining Phase-2
+	// goroutines; syns goroutines were already launched during Phase 1.
+	wg2.Add(2)
 	go func() {
 		defer wg2.Done()
 		if primaryLang != "" && defBlock != "" {
@@ -1238,23 +1244,32 @@ func run(word string, translateLangs []string, debug, offline bool) {
 	}()
 	wg2.Wait()
 
+	// Remap synTargets to match the (possibly filtered) translateLangs slice.
+	{
+		mapped := make([][]string, len(validIdx))
+		mappedT := make([]time.Duration, len(validIdx))
+		for j, idx := range validIdx {
+			mapped[j] = synTargets[idx]
+			mappedT[j] = tSynTargets[idx]
+		}
+		synTargets = mapped
+		tSynTargets = mappedT
+	}
+
 	// Clear the "looking up…" line
 	fmt.Printf("\033[1A\033[2K")
 
 	var fetchLog []string
 	if debug {
 		if entry != nil {
-			fetchLog = append(fetchLog, "phase 1:", fmt.Sprintf("  lookup       xdg (%dms)", tEmbed.Milliseconds()))
+			fetchLog = append(fetchLog, fmt.Sprintf("  xdg          %dms", tEmbed.Milliseconds()))
 		} else {
-			fetchLog = append(fetchLog, "phase 1:",
+			fetchLog = append(fetchLog,
 				fmt.Sprintf("  defn         %dms", tAPI.Milliseconds()),
 				fmt.Sprintf("  etym         %dms", tAPIEtym.Milliseconds()))
 		}
 		for i, lang := range translateLangs {
 			fetchLog = append(fetchLog, fmt.Sprintf("  trans(%s)     %dms", lang, tWordTrans[i].Milliseconds()))
-		}
-		fetchLog = append(fetchLog, "phase 2 (parallel):")
-		for i, lang := range translateLangs {
 			if tSynTargets[i] > 0 {
 				fetchLog = append(fetchLog, fmt.Sprintf("  syns(%s)      %dms", lang, tSynTargets[i].Milliseconds()))
 			}
@@ -1264,15 +1279,6 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		}
 		if tEtymTrans > 0 {
 			fetchLog = append(fetchLog, fmt.Sprintf("  etym-trans   %dms", tEtymTrans.Milliseconds()))
-		}
-	}
-
-	hint := ""
-	if !offline {
-		if usingInstalledPack {
-			hint = "use -o for offline lookups"
-		} else {
-			hint = "run 'lexify install en' then use -o for offline lookups"
 		}
 	}
 
@@ -1290,7 +1296,6 @@ func run(word string, translateLangs []string, debug, offline bool) {
 		Warnings:       warnings,
 		Elapsed:        time.Since(start),
 		FetchLog:       fetchLog,
-		Hint:           hint,
 	})
 }
 

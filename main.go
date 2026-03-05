@@ -1823,7 +1823,8 @@ func printHelp() {
 	fmt.Printf("  %s  --wiki%s   source: en.wiktionary.org XML dump  ~1.2 GB, ~10 min\n", CPos, R)
 	fmt.Printf("  %s  --force%s  reinstall even if pack is already up to date\n", CPos, R)
 	fmt.Printf("  %s-o%s         force live API (skip installed pack)\n", CPos, R)
-	fmt.Printf("  %s-d%s         show per-fetch debug timing\n\n", CPos, R)
+	fmt.Printf("  %s-d%s         show per-fetch debug timing\n", CPos, R)
+	fmt.Printf("  %s--no-gtx-ety%s  skip GTX~ etymology fallback (leave etymology blank when pack/wiki miss)\n\n", CPos, R)
 
 	fmt.Printf("  %s%sEXAMPLES%s\n", CHead, Bold, R)
 	examples := [][2]string{
@@ -2224,7 +2225,7 @@ func buildFetchLog(p debugTimingParams) []string {
 
 // ── Orchestration ─────────────────────────────────────────────────────────────
 
-func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
+func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXEty bool) {
 	start := time.Now()
 	fmt.Printf("\n  %slooking up %s%s%s%s…%s\r", CEx, Bold, word, R, CEx, R)
 
@@ -2498,7 +2499,7 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 		for i, lang := range translateLangs {
 			i, lang := i, lang
 			needsDef := !(i < len(targetEntries) && targetEntries[i] != nil && len(targetEntries[i].Meanings) > 0)
-			needsEtym := etym != "" && !(i < len(targetEntries) && targetEntries[i] != nil && targetEntries[i].Etym != "")
+			needsEtym := !noGTXEty && etym != "" && !(i < len(targetEntries) && targetEntries[i] != nil && targetEntries[i].Etym != "")
 			if needsDef && defBlock != "" {
 				wgFallback.Add(1)
 				go func() {
@@ -2996,22 +2997,24 @@ func main() {
 	debug := false
 	apiOnly := false
 	hintNonEN := false
+	noGTXEty := false
 	var translateLangs []string
 	for _, a := range os.Args[2:] {
-		if a == "-d" {
+		switch a {
+		case "-d":
 			debug = true
-			continue
-		}
-		if a == "-o" {
+		case "-o":
 			apiOnly = true
-			continue
-		}
-		l := strings.ToLower(strings.TrimSpace(a))
-		if l == "en" {
-			hintNonEN = true
-		} else {
-			translateLangs = append(translateLangs, l)
+		case "--no-gtx-ety":
+			noGTXEty = true
+		default:
+			l := strings.ToLower(strings.TrimSpace(a))
+			if l == "en" {
+				hintNonEN = true
+			} else {
+				translateLangs = append(translateLangs, l)
+			}
 		}
 	}
-	run(word, translateLangs, debug, apiOnly, hintNonEN)
+	run(word, translateLangs, debug, apiOnly, hintNonEN, noGTXEty)
 }

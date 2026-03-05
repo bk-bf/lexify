@@ -60,10 +60,7 @@ var dividerWidth = func() int {
 		uintptr(unsafe.Pointer(&ws)),
 	)
 	if errno == 0 && ws.Col > 0 {
-		w := int(ws.Col) - 4 // 2-space left margin + 2-char right breathing room
-		if w < 40 {
-			w = 40
-		}
+		w := max(int(ws.Col)-4, 40) // 2-space left margin + 2-char right breathing room
 		return w
 	}
 	return 76 // fallback: 80-col terminal
@@ -86,7 +83,7 @@ const (
 
 var httpClient = &http.Client{Timeout: 7 * time.Second}
 
-func fetchJSON(rawURL string, target interface{}) error {
+func fetchJSON(rawURL string, target any) error {
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return err
@@ -190,8 +187,8 @@ func resolveTemplate(raw string) string {
 		tr := ""
 		for i, p := range parts[1:] {
 			p = strings.TrimSpace(p)
-			if strings.HasPrefix(p, "tr=") {
-				tr = strings.TrimPrefix(p, "tr=")
+			if after, ok := strings.CutPrefix(p, "tr="); ok {
+				tr = after
 			} else if strings.HasPrefix(p, "t=") || strings.HasPrefix(p, "gloss=") || strings.Contains(p, "=") {
 				continue
 			} else if i+1 == idx { // i+1 because parts[1:] drops name
@@ -679,7 +676,7 @@ func parsePOSSection(pos, text string) *Meaning {
 			pendingEx = ""
 		}
 	}
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if len(defs) >= 3 {
 			break
 		}
@@ -705,7 +702,7 @@ func parsePOSSection(pos, text string) *Meaning {
 	seen := map[string]bool{}
 	var syns []string
 	for _, sm := range synTemplateRe.FindAllStringSubmatch(text, -1) {
-		for _, w := range strings.Split(sm[1], "|") {
+		for w := range strings.SplitSeq(sm[1], "|") {
 			w = strings.TrimSpace(w)
 			if w != "" && !strings.Contains(w, "=") && !seen[w] {
 				seen[w] = true
@@ -721,7 +718,7 @@ func parseSynSection(text string) []string {
 	stripped := stripWikitext(text)
 	seen := map[string]bool{}
 	var result []string
-	for _, line := range strings.Split(stripped, "\n") {
+	for line := range strings.SplitSeq(stripped, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -791,7 +788,7 @@ func parseWiktionaryPage(wikitext, langSection string) (LexEntry, bool) {
 		}
 		curLines = nil
 	}
-	for _, line := range strings.Split(langText, "\n") {
+	for line := range strings.SplitSeq(langText, "\n") {
 		level, heading := parseWikiHeading(line)
 		if level >= 3 {
 			flush()
@@ -1672,7 +1669,7 @@ func render(in RenderInput) {
 		}
 	} else if hasFallbackDef {
 		// No native content — show machine-translated EN text as last resort.
-		for _, para := range strings.Split(in.TargetDefnFallback[0], "\n\n") {
+		for para := range strings.SplitSeq(in.TargetDefnFallback[0], "\n\n") {
 			para = strings.TrimSpace(para)
 			if para == "" {
 				continue
@@ -2262,7 +2259,6 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXE
 		go func() { defer wg1.Done(); rs = resolveWordXDGOrAPI(word, useXDG) }()
 	}
 	for i, lang := range translateLangs {
-		i, lang := i, lang
 		go func() {
 			defer wg1.Done()
 			t := time.Now()
@@ -2272,9 +2268,7 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXE
 			// If an installed pack exists for this lang, query it directly;
 			// otherwise fall back to the Wiktionary API scrape.
 			if wordTrans[i] != nil && wordTrans[i].Word != "" {
-				wg2.Add(1)
-				go func() {
-					defer wg2.Done()
+				wg2.Go(func() {
 					t2 := time.Now()
 					translated := wordTrans[i].Word
 
@@ -2362,7 +2356,7 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXE
 						targetEntries[i] = synthetic
 					}
 					tSynTargets[i] = time.Since(t2)
-				}()
+				})
 			}
 		}()
 	}
@@ -2493,26 +2487,21 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXE
 		}
 		var wgFallback sync.WaitGroup
 		for i, lang := range translateLangs {
-			i, lang := i, lang
 			needsDef := !(i < len(targetEntries) && targetEntries[i] != nil && len(targetEntries[i].Meanings) > 0)
 			needsEtym := !noGTXEty && etym != "" && !(i < len(targetEntries) && targetEntries[i] != nil && targetEntries[i].Etym != "")
 			if needsDef && defBlock != "" {
-				wgFallback.Add(1)
-				go func() {
-					defer wgFallback.Done()
+				wgFallback.Go(func() {
 					t := time.Now()
 					targetDefnFallback[i] = fetchTextTranslation(defBlock, lang)
 					tTargetDefnFallback[i] = time.Since(t)
-				}()
+				})
 			}
 			if needsEtym {
-				wgFallback.Add(1)
-				go func() {
-					defer wgFallback.Done()
+				wgFallback.Go(func() {
 					t := time.Now()
 					targetEtymFallback[i] = fetchTextTranslation(etym, lang)
 					tTargetEtymFallback[i] = time.Since(t)
-				}()
+				})
 			}
 		}
 		wgFallback.Wait()
@@ -2639,10 +2628,7 @@ func (p *installProgress) render() {
 		pctStr := fmt.Sprintf("  %3.0f%%", pct*100)
 		suffix = pctStr + suffix
 		// "  " prefix(2) + desc(13) + " "(1) + bar(barW) + suffix — total ≤ dividerWidth+2
-		barW := dividerWidth - 16 - runeLen(suffix)
-		if barW < 6 {
-			barW = 6
-		}
+		barW := max(dividerWidth-16-runeLen(suffix), 6)
 		filled := int(pct * float64(barW))
 		bar = " " + CBar + strings.Repeat("█", filled) + R + Dim + strings.Repeat("░", barW-filled) + R
 	} else {

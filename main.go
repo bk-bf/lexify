@@ -2139,8 +2139,12 @@ func buildFetchLog(p debugTimingParams) []string {
 					defnSrc = "xdg miss"
 				}
 			} else {
-				if i < len(p.wikiResults) && len(p.wikiResults[i].Meanings) > 0 {
+				hasWikiMeanings := i < len(p.wikiResults) && len(p.wikiResults[i].Meanings) > 0
+				if hasWikiMeanings {
 					defnSrc = "wiki"
+				} else if len(e.Meanings) > 0 {
+					// wiki was skipped — meanings came from native pack
+					defnSrc = "xdg"
 				} else if i < len(p.targetDefnFallback) && p.targetDefnFallback[i] != "" {
 					defnSrc = "wiki miss→gtx~"
 					defnMs = p.tTargetDefnFallback[i].Milliseconds()
@@ -2254,20 +2258,28 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 					t2 := time.Now()
 					translated := wordTrans[i].Word
 
-					// Pack lookup: provides IPA, etym, and possibly syns.
-					// For non-EN langs, pack Meanings are English glosses (kaikki
-					// is sourced from en.wiktionary.org) — we overwrite them below.
+					// Pack lookup: provides IPA, syns, etym, and (for native-edition
+					// packs) target-language definitions and etymology.
 					packEntry := lookupLang(translated, lang)
 
 					// For non-EN target langs, fetch native definitions, synonyms, and
-					// etymology from lang.wiktionary.org in one round-trip.
+					// etymology from lang.wiktionary.org — but only when the pack does
+					// not already provide target-language content. Native-edition packs
+					// (installed from lang.wiktionary.org kaikki dumps) have meanings
+					// and etymology in the target language; skip the API call when they
+					// hit.
 					var wr wikiResult
 					if lang != "en" {
-						wr = fetchTargetWikiData(translated, lang)
-						// If wiki resolved an inflected form to its lemma, retry the
-						// pack lookup with the lemma so XDG syns/etym/IPA aren't lost.
-						if packEntry == nil && wr.ResolvedWord != "" {
-							packEntry = lookupLang(wr.ResolvedWord, lang)
+						needsWiki := !isNativeLangPack(lang) ||
+							packEntry == nil ||
+							len(packEntry.Meanings) == 0
+						if needsWiki {
+							wr = fetchTargetWikiData(translated, lang)
+							// If wiki resolved an inflected form to its lemma, retry the
+							// pack lookup with the lemma so XDG syns/etym/IPA aren't lost.
+							if packEntry == nil && wr.ResolvedWord != "" {
+								packEntry = lookupLang(wr.ResolvedWord, lang)
+							}
 						}
 					}
 
@@ -2289,7 +2301,13 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 						}
 					}
 					if lang != "en" {
-						synthetic.Meanings = wr.Meanings
+						// Prefer wiki meanings (richer content) when available; fall back
+						// to pack meanings (native-edition packs have target-lang glosses).
+						if len(wr.Meanings) > 0 {
+							synthetic.Meanings = wr.Meanings
+						} else if packEntry != nil {
+							synthetic.Meanings = packEntry.Meanings
+						}
 						// For etymology: prefer pack etym (already set above for native
 						// editions). Fall back to wiki etym when pack has none; gated
 						// on minEtymRunes to discard unresolvable stubs (e.g. RU

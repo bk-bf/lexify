@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/bzip2"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
@@ -271,11 +272,14 @@ func resolveTemplate(raw string) string {
 		return ""
 	}
 
-	// Single-argument templates not otherwise handled: return the argument as-is
+	// Single-argument templates not otherwise handled: return the argument as-is.
 	// Covers things like {{lang|word}}, {{smallcaps|word}}, etc.
+	// Exception: drop values that are BCP-47 language codes (2–3 lowercase ASCII
+	// letters) — templates like {{спец.|ru}}, {{п.|ru}} use a language code as
+	// their sole argument and must not emit it as visible text.
 	if len(parts) == 2 {
 		val := strings.TrimSpace(parts[1])
-		if !strings.Contains(val, "=") {
+		if !strings.Contains(val, "=") && !langCodeRe.MatchString(val) {
 			return val
 		}
 	}
@@ -830,8 +834,40 @@ type kEntry struct {
 }
 
 // kaikkiURL returns the Kaikki.org JSONL download URL for the given language.
+// Used for EN and languages without a native kaikki wiktionary edition.
 func kaikkiURL(langName string) string {
 	return fmt.Sprintf("https://kaikki.org/dictionary/%s/kaikki.org-dictionary-%s.jsonl", langName, langName)
+}
+
+// kaikkiNativeEditions maps BCP-47 codes to the kaikki.org native-wiktionary
+// edition prefix (e.g. "ru" → "ruwiktionary"). Packs from these editions have
+// etymology_text written in the target language rather than English.
+var kaikkiNativeEditions = map[string]string{
+	"de": "de", "es": "es", "fr": "fr", "it": "it",
+	"ja": "ja", "ko": "ko", "nl": "nl", "pl": "pl",
+	"pt": "pt", "ru": "ru", "tr": "tr", "zh": "zh",
+}
+
+// kaikkiNativeURL returns the raw wiktextract JSONL.GZ download URL for langs
+// that have a native kaikki wiktionary edition, or ("", false) otherwise.
+func kaikkiNativeURL(lang string) (string, bool) {
+	if _, ok := kaikkiNativeEditions[lang]; ok {
+		return fmt.Sprintf("https://kaikki.org/%swiktionary/raw-wiktextract-data.jsonl.gz", lang), true
+	}
+	return "", false
+}
+
+// nativePath returns the path to the lang.native marker file which records
+// that the installed pack was built from a native-language wiktionary edition.
+func nativePath(lang string) string {
+	return filepath.Join(xdgDataDir(), lang+".native")
+}
+
+// isNativeLangPack reports whether the installed pack for lang was sourced from
+// a native kaikki wiktionary edition (so etymology_text is in the target lang).
+func isNativeLangPack(lang string) bool {
+	_, err := os.Stat(nativePath(lang))
+	return err == nil
 }
 
 // convertKEntry converts a raw Kaikki entry to a LexEntry.
@@ -1325,6 +1361,9 @@ func fetchTextTranslation(text, lang string) string {
 // template, e.g. {{Wortart|Adjektiv|Deutsch}} → "Adjektiv", {{S|adjectif|fr}} → "adjectif".
 var headingTemplateArgRe = regexp.MustCompile(`\{\{[^|{}]+\|([^|{}]+)`)
 
+// langCodeRe matches BCP-47 language codes (2–3 lowercase ASCII letters, whole string).
+var langCodeRe = regexp.MustCompile(`^[a-z]{2,3}$`)
+
 // extractHeadingPOS returns the part-of-speech name from a wikitext heading string.
 // Plain-text headings (EN wiki) are returned as-is; template-based headings used by
 // DE, FR, RU, etc. are resolved via their first template argument.
@@ -1780,7 +1819,7 @@ func printHelp() {
 
 	fmt.Printf("  %s%sFLAGS%s\n", CHead, Bold, R)
 	fmt.Printf("  %s-i <lang> [lang ...]%s  install offline pack  (e.g. lexify -i en de ru)\n", CPos, R)
-	fmt.Printf("  %s  --kaikki%s  source: kaikki.org JSONL  ~500 MB, ~2 min  %s(default)%s\n", CPos, R, Dim, R)
+	fmt.Printf("  %s  --kaikki%s  source: kaikki.org JSONL  ~200–500 MB  %s(default; native editions for de fr es it pt ru ja zh ko nl pl tr)%s\n", CPos, R, Dim, R)
 	fmt.Printf("  %s  --wiki%s   source: en.wiktionary.org XML dump  ~1.2 GB, ~10 min\n", CPos, R)
 	fmt.Printf("  %s  --force%s  reinstall even if pack is already up to date\n", CPos, R)
 	fmt.Printf("  %s-o%s         force live API (skip installed pack)\n", CPos, R)
@@ -2234,12 +2273,13 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 
 					// Build synthetic entry.
 					// IPA and syns from pack are language-neutral so always preferred.
-					// Etym from pack is sourced from en.wiktionary.org (always English),
-					// so for non-EN targets we use wiki etym instead.
+					// For etym: native-edition packs (isNativeLangPack) have etymology_text
+					// in the target language; en.wiktionary.org-sourced packs have English.
+					// Use pack etym only when it is in the right language.
 					synthetic := &LexEntry{}
 					if packEntry != nil {
 						synthetic.IPA = packEntry.IPA
-						if lang == "en" {
+						if lang == "en" || isNativeLangPack(lang) {
 							synthetic.Etym = packEntry.Etym
 						}
 						if len(packEntry.Syns) > 0 {
@@ -2250,31 +2290,17 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 					}
 					if lang != "en" {
 						synthetic.Meanings = wr.Meanings
-						// Accept wiki etym only when it is long enough to be a real
-						// etymology. Many non-EN Wiktionary pages store their etymology
-						// in a separate transclusion template (e.g. RU
-						// {{этимология:бить|да}}) that we cannot resolve without an
-						// extra API call. When that template is missing or empty, what
-						// survives after stripping is a dangling fragment like
-						// "Происходит от" — technically non-empty but useless.
-						// Gating on minEtymRunes discards those stubs and leaves
-						// synthetic.Etym empty, which causes needsEtym=true and the
-						// GTX~ fallback to fire in the next pass.
-						//
-						// TODO: find a proper XDG/API source for target-language
-						// etymology. Options worth evaluating:
-						//   - kaikki.org packs include etymology_text from
-						//     en.wiktionary.org, but the text is English; a
-						//     target-lang kaikki dump would solve this cleanly.
-						//   - MediaWiki action=parse&prop=text returns fully-rendered
-						//     HTML for a section (including transclusions), which
-						//     would give us the real etymology string without a
-						//     second lookup — at the cost of HTML stripping on top.
-						//   - Wikidata etymological properties (P5191 "derived from")
-						//     are structured but sparse and require an extra query.
-						if runeLen(wr.Etym) >= minEtymRunes {
-							synthetic.Etym = wr.Etym
-							wr.EtymFromWiki = true
+						// For etymology: prefer pack etym (already set above for native
+						// editions). Fall back to wiki etym when pack has none; gated
+						// on minEtymRunes to discard unresolvable stubs (e.g. RU
+						// {{этимология:бить|да}} templates that survive stripping as
+						// bare fragments like "Происходит от"). When both miss, the
+						// GTX~ fallback fires in the next pass.
+						if synthetic.Etym == "" {
+							if runeLen(wr.Etym) >= minEtymRunes {
+								synthetic.Etym = wr.Etym
+								wr.EtymFromWiki = true
+							}
 						}
 						if !synPackHits[i] && len(wr.Syns) > 0 {
 							synTargets[i] = wr.Syns
@@ -2630,14 +2656,25 @@ func cmdInstall(lang, source string, force bool) {
 
 	// Determine download URL and temp file extension from source.
 	var dlURL, tmpExt string
+	var kaikkiGZ bool // true when kaikki download is gzip-compressed (native edition)
 	switch source {
 	case "wiki":
 		dlURL = wiktionaryDumpURL()
 		tmpExt = ".xml.bz2.tmp"
 	default: // "kaikki"
 		source = "kaikki"
-		dlURL = kaikkiURL(langName)
-		tmpExt = ".jsonl.tmp"
+		if nativeURL, ok := kaikkiNativeURL(lang); ok {
+			// Native wiktionary edition: raw wiktextract JSONL.GZ, filtered by
+			// lang_code during parse. Etymologies are in the target language.
+			dlURL = nativeURL
+			tmpExt = ".jsonl.gz.tmp"
+			kaikkiGZ = true
+		} else {
+			// No native edition available: fall back to kaikki.org/dictionary/
+			// (sourced from en.wiktionary.org — etymologies will be in English).
+			dlURL = kaikkiURL(langName)
+			tmpExt = ".jsonl.tmp"
+		}
 	}
 
 	// ── Up-to-date check: HEAD request → Last-Modified ─────────────────
@@ -2715,7 +2752,17 @@ func cmdInstall(lang, source string, force bool) {
 
 	switch source {
 	case "kaikki":
-		scanner := bufio.NewScanner(parseRdr)
+		var scanSrc io.Reader = parseRdr
+		if kaikkiGZ {
+			gz, err := gzip.NewReader(parseRdr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "lexify -i: gzip: %v\n", err)
+				os.Exit(1)
+			}
+			defer gz.Close()
+			scanSrc = gz
+		}
+		scanner := bufio.NewScanner(scanSrc)
 		scanner.Buffer(make([]byte, 4<<20), 4<<20)
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -2832,6 +2879,13 @@ func cmdInstall(lang, source string, force bool) {
 	// ── Version file ────────────────────────────────────────────────────
 	ver := fmt.Sprintf("source: %s\nbuilt:  %s\nlast-modified: %s\n", dlURL, time.Now().Format(time.RFC3339), remoteLastMod)
 	os.WriteFile(verPath, []byte(ver), 0o644) //nolint
+
+	// Mark whether this pack provides native-language etymology (for runtime use).
+	if kaikkiGZ {
+		os.WriteFile(nativePath(lang), []byte("native"), 0o644) //nolint
+	} else {
+		os.Remove(nativePath(lang)) //nolint
+	}
 
 	fmt.Printf("\n  %s%s pack installed.%s\n\n",
 		Bold+CSyn, strings.ToUpper(lang), R)

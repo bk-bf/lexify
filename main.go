@@ -96,11 +96,7 @@ func fetchJSON(rawURL string, target interface{}) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, target)
+	return json.NewDecoder(resp.Body).Decode(target)
 }
 
 // ── Text helpers ──────────────────────────────────────────────────────────────
@@ -300,21 +296,40 @@ func resolveTemplate(raw string) string {
 var danglingConnectorRe = regexp.MustCompile(
 	`(?i)(?:^|\.)\s*[\p{L} ]*(от|из|далее из|далее|von|aus|de|da|from|of|del|della|di|du|der|dem|den|des|af|van|fr\S*|fra|further from)\s*$`)
 
+// wikitext cleanup regexes — compiled once at package level so they are not
+// re-compiled on every stripWikitext call (cmdInstall calls it ~500k times).
+var (
+	wikiHTMLCommentRe  = regexp.MustCompile(`(?s)<!--.*?-->`)
+	wikiRefBlockRe     = regexp.MustCompile(`(?s)<ref[^>]*>.*?</ref>`)
+	wikiRefSelfRe      = regexp.MustCompile(`<ref[^>]*/>`)
+	wikiHTMLTagRe      = regexp.MustCompile(`<[^>]+>`)
+	wikiTmplRe         = regexp.MustCompile(`\{\{([^{}]*)\}\}`)
+	wikiLinkDispRe     = regexp.MustCompile(`\[\[(?:[^\]|]+\|)([^\]]+)\]\]`)
+	wikiLinkRe         = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
+	wikiListMarkerRe   = regexp.MustCompile(`(?m)^[#*:;]+\s*`)
+	wikiDupDotRe       = regexp.MustCompile(`(\. ){2,}\.?`)
+	wikiDupCommaRe     = regexp.MustCompile(`(, ){2,},?`)
+	wikiEmptyParenRe   = regexp.MustCompile(`\(\s*\)`)
+	wikiMultiSpaceRe   = regexp.MustCompile(` {2,}`)
+	wikiMultiNewlineRe = regexp.MustCompile(`\n{3,}`)
+
+	// synSplitRe splits synonym lines on comma/semicolon separators.
+	synSplitRe = regexp.MustCompile(`[,;]+`)
+	// synTemplateRe extracts synonym words from {{syn|lang|word1|…}} templates.
+	synTemplateRe = regexp.MustCompile(`\{\{syn\|[^|{}]+\|([^{}]+)\}\}`)
+)
+
 func stripWikitext(text string) string {
 	// Decode HTML entities (&nbsp; → " ", &amp; → "&", &#160; → " ", etc.)
 	text = html.UnescapeString(text)
-	// Strip HTML comments <!-- ... -->
-	text = regexp.MustCompile(`(?s)<!--.*?-->`).ReplaceAllString(text, "")
-	// Strip <ref>...</ref> and self-closing <ref ... />  (footnote citations)
-	text = regexp.MustCompile(`(?s)<ref[^>]*>.*?</ref>`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`<ref[^>]*/>`).ReplaceAllString(text, "")
-	// Strip remaining HTML tags
-	text = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(text, "")
+	text = wikiHTMLCommentRe.ReplaceAllString(text, "")
+	text = wikiRefBlockRe.ReplaceAllString(text, "")
+	text = wikiRefSelfRe.ReplaceAllString(text, "")
+	text = wikiHTMLTagRe.ReplaceAllString(text, "")
 
 	// Resolve innermost {{ }} templates first (no nesting), repeat until stable
-	tmplRe := regexp.MustCompile(`\{\{([^{}]*)\}\}`)
 	for {
-		n := tmplRe.ReplaceAllStringFunc(text, func(m string) string {
+		n := wikiTmplRe.ReplaceAllStringFunc(text, func(m string) string {
 			inner := m[2 : len(m)-2]
 			return resolveTemplate(inner)
 		})
@@ -324,21 +339,21 @@ func stripWikitext(text string) string {
 		text = n
 	}
 	// [[link|display]] → display
-	text = regexp.MustCompile(`\[\[(?:[^\]|]+\|)([^\]]+)\]\]`).ReplaceAllString(text, "$1")
+	text = wikiLinkDispRe.ReplaceAllString(text, "$1")
 	// [[link]] → link
-	text = regexp.MustCompile(`\[\[([^\]]+)\]\]`).ReplaceAllString(text, "$1")
+	text = wikiLinkRe.ReplaceAllString(text, "$1")
 	// remove '''bold''' and ''italic'' markers
 	text = strings.ReplaceAll(text, "'''", "")
 	text = strings.ReplaceAll(text, "''", "")
 	// remove wikitext list/indent markers at start of lines
-	text = regexp.MustCompile(`(?m)^[#*:;]+\s*`).ReplaceAllString(text, "")
+	text = wikiListMarkerRe.ReplaceAllString(text, "")
 	// tidy up punctuation artefacts left by removed templates: ". ." "( )" ", ,"
-	text = regexp.MustCompile(`(\. ){2,}\.?`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`(, ){2,},?`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`\(\s*\)`).ReplaceAllString(text, "")
+	text = wikiDupDotRe.ReplaceAllString(text, "")
+	text = wikiDupCommaRe.ReplaceAllString(text, "")
+	text = wikiEmptyParenRe.ReplaceAllString(text, "")
 	// tidy up spacing artefacts from removed templates
-	text = regexp.MustCompile(` {2,}`).ReplaceAllString(text, " ")
-	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
+	text = wikiMultiSpaceRe.ReplaceAllString(text, " ")
+	text = wikiMultiNewlineRe.ReplaceAllString(text, "\n\n")
 	text = strings.TrimSpace(text)
 	// Remove dangling connector/preposition fragments left when a transclusion
 	// template resolved to empty (e.g. RU "Происходит от" with no continuation).
@@ -478,8 +493,9 @@ func (p *installedPack) Lookup(word string) *LexEntry {
 // nil when no pack is installed; lookupEN returns nil in that case and run() falls
 // back to the dictionaryapi.dev network API.
 var enProvider = func() *installedPack {
-	idxPath := filepath.Join(xdgDataDir(), "en.idx")
-	datPath := filepath.Join(xdgDataDir(), "en.dat")
+	dir := xdgDataDir()
+	idxPath := filepath.Join(dir, "en.idx")
+	datPath := filepath.Join(dir, "en.dat")
 	if _, err := os.Stat(idxPath); err == nil {
 		p := &installedPack{idxPath: idxPath, datPath: datPath}
 		go p.init()
@@ -499,7 +515,8 @@ func lookupEN(word string) *LexEntry {
 // Built once at startup by scanning the XDG data dir.
 var packRegistry = func() map[string]*installedPack {
 	packs := map[string]*installedPack{}
-	entries, err := os.ReadDir(xdgDataDir())
+	dir := xdgDataDir()
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return packs
 	}
@@ -512,7 +529,6 @@ var packRegistry = func() map[string]*installedPack {
 		if lang == "en" {
 			continue // handled by enProvider
 		}
-		dir := xdgDataDir()
 		idxPath := filepath.Join(dir, name)
 		datPath := filepath.Join(dir, lang+".dat")
 		if _, err := os.Stat(datPath); err != nil {
@@ -562,13 +578,13 @@ type xmlPage struct {
 
 // posSections is the set of Wiktionary section headings (lowercased) that
 // represent a part-of-speech and contain numbered definitions.
-var posSections = map[string]bool{
-	"noun": true, "verb": true, "adjective": true, "adverb": true,
-	"pronoun": true, "preposition": true, "conjunction": true,
-	"interjection": true, "determiner": true, "article": true,
-	"numeral": true, "particle": true, "phrase": true,
-	"suffix": true, "prefix": true, "affix": true,
-	"proper noun": true, "proverb": true, "idiom": true,
+var posSections = map[string]struct{}{
+	"noun": {}, "verb": {}, "adjective": {}, "adverb": {},
+	"pronoun": {}, "preposition": {}, "conjunction": {},
+	"interjection": {}, "determiner": {}, "article": {},
+	"numeral": {}, "particle": {}, "phrase": {},
+	"suffix": {}, "prefix": {}, "affix": {},
+	"proper noun": {}, "proverb": {}, "idiom": {},
 }
 
 // ipaExtractRe matches the first IPA argument from {{IPA|lang|/…/|…}}.
@@ -613,32 +629,37 @@ func appendUniq(dst []string, src ...string) []string {
 	return dst
 }
 
+// truncateRunes returns s truncated to maxLen runes at a word boundary, appending "…".
+// Returns the original string unchanged when len([]rune(s)) <= maxLen.
+func truncateRunes(s string, maxLen int) string {
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	i := maxLen - 3
+	for i > 0 && r[i] != ' ' {
+		i--
+	}
+	if i == 0 {
+		i = maxLen - 3
+	}
+	return string(r[:i]) + "…"
+}
+
 // trimEtym caps etymology text at 500 runes at a sentence boundary.
 func trimEtym(etym string) string {
 	r := []rune(etym)
 	if len(r) <= 500 {
 		return etym
 	}
-	cut := -1
 	for i := 499; i >= 0; i-- {
 		if r[i] == '.' || r[i] == '!' || r[i] == '?' {
 			if i+1 == len(r) || r[i+1] == ' ' {
-				cut = i + 1
-				break
+				return strings.TrimSpace(string(r[:i+1])) + "…"
 			}
 		}
 	}
-	if cut > 0 {
-		return strings.TrimSpace(string(r[:cut])) + "…"
-	}
-	i := 497
-	for i > 0 && r[i] != ' ' {
-		i--
-	}
-	if i == 0 {
-		i = 497
-	}
-	return string(r[:i]) + "…"
+	return truncateRunes(etym, 500)
 }
 
 // parsePOSSection extracts up to 3 definitions (with first usage example each)
@@ -667,18 +688,8 @@ func parsePOSSection(pos, text string) *Meaning {
 		case strings.HasPrefix(line, "#:") && pendingText != "" && pendingEx == "":
 			raw := strings.TrimSpace(strings.TrimPrefix(line, "#:"))
 			ex := strings.TrimSpace(stripWikitext(raw))
-			r := []rune(ex)
-			if len(r) >= 2 && len(r) <= 150 {
-				pendingEx = ex
-			} else if len(r) > 150 {
-				i := 147
-				for i > 0 && r[i] != ' ' {
-					i--
-				}
-				if i == 0 {
-					i = 147
-				}
-				pendingEx = string(append(r[:i], '…'))
+			if len([]rune(ex)) >= 2 {
+				pendingEx = truncateRunes(ex, 150)
 			}
 		}
 	}
@@ -687,10 +698,9 @@ func parsePOSSection(pos, text string) *Meaning {
 		return nil
 	}
 	// Collect sense-level synonyms from {{syn|lang|word1|word2|…}} templates.
-	synRe := regexp.MustCompile(`\{\{syn\|[^|{}]+\|([^{}]+)\}\}`)
 	seen := map[string]bool{}
 	var syns []string
-	for _, sm := range synRe.FindAllStringSubmatch(text, -1) {
+	for _, sm := range synTemplateRe.FindAllStringSubmatch(text, -1) {
 		for _, w := range strings.Split(sm[1], "|") {
 			w = strings.TrimSpace(w)
 			if w != "" && !strings.Contains(w, "=") && !seen[w] {
@@ -712,7 +722,7 @@ func parseSynSection(text string) []string {
 		if line == "" {
 			continue
 		}
-		for _, w := range regexp.MustCompile(`[,;]+`).Split(line, -1) {
+		for _, w := range synSplitRe.Split(line, -1) {
 			w = strings.TrimSpace(w)
 			r := []rune(w)
 			if len(r) < 2 || len(r) > 40 {
@@ -755,6 +765,7 @@ func parseWiktionaryPage(wikitext, langSection string) (LexEntry, bool) {
 		}
 		text := strings.Join(curLines, "\n")
 		lower := strings.ToLower(strings.TrimSpace(curHeading))
+		_, isPOS := posSections[lower]
 		switch {
 		case lower == "pronunciation":
 			if m := ipaExtractRe.FindStringSubmatch(text); m != nil {
@@ -762,7 +773,7 @@ func parseWiktionaryPage(wikitext, langSection string) (LexEntry, bool) {
 			}
 		case lower == "etymology" || strings.HasPrefix(lower, "etymology "):
 			etym = trimEtym(stripWikitext(text))
-		case posSections[lower]:
+		case isPOS:
 			if m := parsePOSSection(curHeading, text); m != nil {
 				meanings = append(meanings, *m)
 				allSyns = appendUniq(allSyns, m.Syns...)
@@ -851,19 +862,9 @@ func convertKEntry(k kEntry) (string, LexEntry) {
 		}
 		example := ""
 		if len(s.Examples) > 0 {
-			ex := []rune(strings.TrimSpace(s.Examples[0].Text))
-			if len(ex) > 150 {
-				i := 147
-				for i > 0 && ex[i] != ' ' {
-					i--
-				}
-				if i == 0 {
-					i = 147
-				}
-				ex = append(ex[:i], '…')
-			}
-			if len(ex) >= 2 {
-				example = string(ex)
+			ex := strings.TrimSpace(s.Examples[0].Text)
+			if len([]rune(ex)) >= 2 {
+				example = truncateRunes(ex, 150)
 			}
 		}
 		defs = append(defs, Def{Text: gloss, Example: example})
@@ -1098,12 +1099,8 @@ func fetchGTX(word, lang string) (*Translation, bool) {
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, true
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, false
-	}
 	var raw []json.RawMessage
-	if json.Unmarshal(body, &raw) != nil || len(raw) == 0 {
+	if json.NewDecoder(resp.Body).Decode(&raw) != nil || len(raw) == 0 {
 		return nil, false
 	}
 	translated := parseGTXSegments(raw)
@@ -1137,7 +1134,34 @@ func fetchMyMemory(word, lang string) *Translation {
 	if t == "" || strings.EqualFold(t, word) || strings.Contains(strings.ToUpper(t), "INVALID") {
 		return nil
 	}
+	// TODO: Detected is hardcoded "en" because MyMemory's responseData does not
+	// expose the detected source language. The match.segment field in the full
+	// response can carry it, but only when langpair is "autodetect|<lang>" \u2014
+	// swap the endpoint's "auto" to "autodetect" and parse match[0].source to
+	// populate Detected correctly instead of assuming English.
 	return &Translation{Word: t, Detected: "en", Source: "mymemory"}
+}
+
+// fetchDefnAndEtymPar fetches an English definition and etymology concurrently,
+// returning both along with their individual round-trip durations.
+// Replaces the repeated inline wgFB goroutine pair that appeared in run().
+func fetchDefnAndEtymPar(word string) (defn *Definition, etym string, tDefn, tEtym time.Duration) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		t := time.Now()
+		defn = fetchDefinition(word)
+		tDefn = time.Since(t)
+	}()
+	go func() {
+		defer wg.Done()
+		t := time.Now()
+		etym = fetchEtymologyWiki(word)
+		tEtym = time.Since(t)
+	}()
+	wg.Wait()
+	return
 }
 
 func fetchTranslation(word, lang string) *Translation {
@@ -1383,8 +1407,6 @@ func parseDefsFromWikitext(fullText string) []Meaning {
 	return result
 }
 
-// wiktionaryLemma uses the opensearch API to find the canonical/lemma form of
-// a word when the direct page lookup returns nothing (e.g. inflected form with
 // templateArgRe captures up to the first 3 positional arguments of any wikitext
 // template. Named/keyword arguments (containing "=") are excluded by the character
 // class so they don't pollute the positional slots.
@@ -1421,6 +1443,8 @@ func wikiFlexionLemma(wikitext, word string) string {
 	return ""
 }
 
+// wiktionaryLemma uses the opensearch API to find the canonical/lemma form of
+// a word when the direct page lookup returns nothing (e.g. inflected form with
 // no own article). Returns the first result that is a proper prefix of word
 // (so "einheitlich" is preferred over "einheitliche"), or the first result that
 // differs from word by simple suffix, or "" if nothing useful is found.
@@ -1660,7 +1684,7 @@ func render(in RenderInput) {
 	}
 
 	// ── synonyms (source language) ────────────────────────────────────────────
-	allSyn := dedupe(in.SynSource)
+	allSyn := appendUniq(nil, in.SynSource...)
 	if in.Defn != nil {
 		for _, m := range in.Defn.Meanings {
 			allSyn = appendUniq(allSyn, m.Syns...)
@@ -1797,18 +1821,6 @@ func printHelp() {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-func dedupe(s []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(s))
-	for _, v := range s {
-		if !seen[v] {
-			seen[v] = true
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
 // normalizePOS maps abbreviated and variant POS labels (from kaikki JSONL) to their
 // full English equivalents used by the API, so both sources render identically.
 var posNorm = map[string]string{
@@ -1844,39 +1856,324 @@ func normalizePOS(pos string) string {
 	return l
 }
 
+// ── Orchestration helpers ─────────────────────────────────────────────────────
+
+// fetchTimingLog accumulates per-fetch timing rows for the -d debug output.
+// section() sets a pending header that is flushed lazily before the next row,
+// so empty sections produce no output at all.
+type fetchTimingLog struct {
+	lines      []string
+	pendingHdr string
+}
+
+func (f *fetchTimingLog) section(phase string, total time.Duration) {
+	f.pendingHdr = fmt.Sprintf("├─ %s (%dms) %s", phase, total.Milliseconds(),
+		strings.Repeat("─", max(0, 27-len(phase)-len(fmt.Sprintf("(%dms)", total.Milliseconds())))))
+}
+
+func (f *fetchTimingLog) add(label string, ms int64, src string) {
+	if f.pendingHdr != "" {
+		f.lines = append(f.lines, f.pendingHdr)
+		f.pendingHdr = ""
+	}
+	srcStr := ""
+	if src != "" {
+		srcStr = "  " + src
+	}
+	f.lines = append(f.lines, fmt.Sprintf("│  %-12s %5dms%s", label, ms, srcStr))
+}
+
+// build wraps accumulated rows in box-drawing borders, or returns nil if empty.
+func (f *fetchTimingLog) build() []string {
+	if len(f.lines) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(f.lines)+2)
+	out = append(out, "┌"+strings.Repeat("─", 33))
+	out = append(out, f.lines...)
+	out = append(out, "└"+strings.Repeat("─", 33))
+	return out
+}
+
+// resolveState holds all results and timing produced by the Phase-1 EN-word
+// resolution path, so run() can read them cleanly after wg1.Wait().
+type resolveState struct {
+	entry        *LexEntry
+	apiDefn      *Definition
+	apiEtym      string
+	resolvedEN   string
+	apiFallback  bool
+	p1XDGHit     bool
+	resolveInP1  bool
+	tEmbed       time.Duration
+	tAPI         time.Duration
+	tAPIEtym     time.Duration
+	tResolve     time.Duration
+	tResolveXDG  time.Duration
+	tResolveDefn time.Duration
+	tP1Total     time.Duration
+}
+
+// resolveWordXDGOrAPI tries the XDG pack first (when useXDG) and falls back to
+// the network API on a miss. Covers both the pack-enabled and API-only paths.
+func resolveWordXDGOrAPI(word string, useXDG bool) (rs resolveState) {
+	if useXDG {
+		t := time.Now()
+		rs.entry = lookupEN(word)
+		rs.tEmbed = time.Since(t)
+		if rs.entry != nil {
+			rs.p1XDGHit = true
+		} else {
+			rs.apiDefn, rs.apiEtym, rs.tAPI, rs.tAPIEtym = fetchDefnAndEtymPar(word)
+			if rs.apiDefn != nil {
+				rs.apiFallback = true
+			}
+		}
+	} else {
+		rs.apiDefn, rs.apiEtym, rs.tAPI, rs.tAPIEtym = fetchDefnAndEtymPar(word)
+	}
+	return
+}
+
+// resolveNonENWord handles Phase-1 when the user flagged the input as non-English.
+// It translates the word → English via GTX, then looks up the English form in XDG/API.
+func resolveNonENWord(word string, useXDG bool) (rs resolveState) {
+	tStart := time.Now()
+	t := time.Now()
+	enTrans, _ := fetchGTX(word, "en")
+	rs.tResolve = time.Since(t)
+	if enTrans != nil {
+		rs.resolveInP1 = true
+		rs.resolvedEN = enTrans.Word
+		if useXDG {
+			t2 := time.Now()
+			if e := lookupEN(enTrans.Word); e != nil {
+				rs.tResolveXDG = time.Since(t2)
+				rs.entry = e
+				rs.p1XDGHit = true
+			} else {
+				rs.tResolveXDG = time.Since(t2)
+				rs.apiDefn, rs.apiEtym, rs.tResolveDefn, _ = fetchDefnAndEtymPar(enTrans.Word)
+				if rs.apiDefn != nil {
+					rs.apiFallback = true
+				}
+			}
+		} else {
+			// apiOnly or no pack: query API for the resolved EN word directly.
+			rs.apiDefn, rs.apiEtym, rs.tResolveDefn, _ = fetchDefnAndEtymPar(enTrans.Word)
+		}
+	} else {
+		// GTX returned nil — the word is already English; fall back to direct lookup.
+		rs = resolveWordXDGOrAPI(word, useXDG)
+	}
+	rs.tP1Total = time.Since(tStart)
+	return
+}
+
+// debugTimingParams bundles all data needed by buildFetchLog.
+type debugTimingParams struct {
+	// Phase-1 decision flags.
+	hintNonEN   bool
+	useXDG      bool
+	p1XDGHit    bool
+	resolveInP1 bool
+	// Phase-1 timings.
+	tEmbed            time.Duration
+	tAPI              time.Duration
+	tAPIEtym          time.Duration
+	tResolve          time.Duration
+	tResolveXDG       time.Duration
+	tResolveDefn      time.Duration
+	tP1GoroutineTotal time.Duration
+	// Per-lang timings.
+	tWordTrans          []time.Duration
+	tSynTargets         []time.Duration
+	tTargetDefnFallback []time.Duration
+	tTargetEtymFallback []time.Duration
+	// Per-lang results (for source-label logic).
+	translateLangs     []string
+	wordTrans          []*Translation
+	etym               string
+	targetEntries      []*LexEntry
+	wikiResults        []wikiResult
+	targetDefnFallback []string
+	targetEtymFallback []string
+	synPackHits        []bool
+}
+
+// buildFetchLog produces the -d debug timing table from collected timing data.
+func buildFetchLog(p debugTimingParams) []string {
+	maxDur := func(ds ...time.Duration) time.Duration {
+		var m time.Duration
+		for _, d := range ds {
+			if d > m {
+				m = d
+			}
+		}
+		return m
+	}
+	tl := &fetchTimingLog{}
+
+	// Phase 1 wall time = max of all parallel tasks in wg1.
+	var p1Dur []time.Duration
+	if p.hintNonEN {
+		p1Dur = append(p1Dur, p.tP1GoroutineTotal)
+	} else if p.useXDG {
+		p1Dur = append(p1Dur, p.tEmbed)
+		if !p.p1XDGHit {
+			p1Dur = append(p1Dur, p.tAPI, p.tAPIEtym)
+		}
+	} else {
+		p1Dur = append(p1Dur, p.tAPI, p.tAPIEtym)
+	}
+	for _, d := range p.tWordTrans {
+		p1Dur = append(p1Dur, d)
+	}
+	p1Total := maxDur(p1Dur...)
+
+	// Phase 2 wall time = max of all parallel tasks in wg2.
+	var p2Dur []time.Duration
+	for _, d := range p.tSynTargets {
+		p2Dur = append(p2Dur, d)
+	}
+	for _, d := range p.tTargetDefnFallback {
+		p2Dur = append(p2Dur, d)
+	}
+	for _, d := range p.tTargetEtymFallback {
+		p2Dur = append(p2Dur, d)
+	}
+	p2Total := maxDur(p2Dur...)
+
+	// ── Phase 1 rows ─────────────────────────────────────────────────────────
+	tl.section("phase 1", p1Total)
+	for i, lang := range p.translateLangs {
+		src := ""
+		if p.wordTrans[i] != nil {
+			src = p.wordTrans[i].Source
+		}
+		tl.add("trans("+lang+")", p.tWordTrans[i].Milliseconds(), src)
+	}
+	if !p.resolveInP1 {
+		if p.p1XDGHit {
+			tl.add("syns(en)", p.tEmbed.Milliseconds(), "xdg")
+		} else if p.useXDG {
+			tl.add("syns(en)", p.tEmbed.Milliseconds(), "xdg miss")
+			if p.tAPI > 0 {
+				tl.add("defn", p.tAPI.Milliseconds(), "api")
+			}
+			if p.etym != "" && p.tAPIEtym > 0 {
+				tl.add("etym", p.tAPIEtym.Milliseconds(), "api")
+			}
+		} else {
+			tl.add("defn", p.tAPI.Milliseconds(), "api")
+			if p.etym != "" {
+				tl.add("etym", p.tAPIEtym.Milliseconds(), "api")
+			}
+		}
+	}
+
+	// ── Resolve rows (non-EN source word routed through GTX → EN) ────────────
+	if p.tResolve > 0 {
+		resolveTotal := p.tResolve + p.tResolveXDG + p.tResolveDefn
+		tl.section("resolve", resolveTotal)
+		tl.add("gtx→en", p.tResolve.Milliseconds(), "gtx")
+		if p.tResolveXDG > 0 {
+			tl.add("syns(en)", p.tResolveXDG.Milliseconds(), "xdg")
+		}
+		if p.tResolveDefn > 0 {
+			tl.add("defn", p.tResolveDefn.Milliseconds(), "api")
+		}
+	}
+
+	// ── Phase 2 rows ─────────────────────────────────────────────────────────
+	tl.section("phase 2", p2Total)
+	for i, lang := range p.translateLangs {
+		hasEntry := i < len(p.targetEntries) && p.targetEntries[i] != nil
+		if hasEntry {
+			e := p.targetEntries[i]
+			// Definition source label.
+			var defnSrc string
+			defnMs := p.tSynTargets[i].Milliseconds()
+			if lang == "en" {
+				defnSrc = "xdg"
+				if len(e.Meanings) == 0 {
+					defnSrc = "xdg miss"
+				}
+			} else {
+				if i < len(p.wikiResults) && len(p.wikiResults[i].Meanings) > 0 {
+					defnSrc = "wiki"
+				} else if i < len(p.targetDefnFallback) && p.targetDefnFallback[i] != "" {
+					defnSrc = "wiki miss→gtx~"
+					defnMs = p.tTargetDefnFallback[i].Milliseconds()
+				} else {
+					defnSrc = "wiki miss"
+				}
+			}
+			// Etymology source label.
+			var etymSrc string
+			etymMs := int64(0)
+			etymFromWiki := i < len(p.wikiResults) && p.wikiResults[i].EtymFromWiki
+			if e.Etym != "" && !etymFromWiki {
+				etymSrc = "xdg"
+			} else if etymFromWiki {
+				etymSrc = "wiki"
+			} else if i < len(p.targetEtymFallback) && p.targetEtymFallback[i] != "" {
+				if lang == "en" {
+					etymSrc = "xdg miss→gtx~"
+				} else {
+					etymSrc = "wiki miss→gtx~"
+				}
+				etymMs = p.tTargetEtymFallback[i].Milliseconds()
+			} else {
+				if lang == "en" {
+					etymSrc = "xdg miss"
+				} else {
+					etymSrc = "wiki miss"
+				}
+			}
+			tl.add("defn("+lang+")", defnMs, defnSrc)
+			tl.add("etym("+lang+")", etymMs, etymSrc)
+		} else {
+			if i < len(p.targetDefnFallback) && p.targetDefnFallback[i] != "" {
+				tl.add("defn("+lang+")", p.tTargetDefnFallback[i].Milliseconds(), "gtx~")
+			}
+			if i < len(p.targetEtymFallback) && p.targetEtymFallback[i] != "" {
+				tl.add("etym("+lang+")", p.tTargetEtymFallback[i].Milliseconds(), "gtx~")
+			}
+		}
+		if p.tSynTargets[i] > 0 || p.synPackHits[i] {
+			synSrc := "api"
+			if p.synPackHits[i] {
+				synSrc = "xdg"
+			} else if lang != "en" {
+				synSrc = "wiki"
+				if !hasEntry {
+					synSrc = "api"
+				}
+			}
+			tl.add("syns("+lang+")", 0, synSrc)
+		}
+	}
+
+	return tl.build()
+}
+
 // ── Orchestration ─────────────────────────────────────────────────────────────
 
 func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	start := time.Now()
 	fmt.Printf("\n  %slooking up %s%s%s%s…%s\r", CEx, Bold, word, R, CEx, R)
 
-	// ── Phase 1: XDG lookup (when pack installed) + word translations — fully parallel ─
-	// By default, lookupEN is fired when a pack is available; its goroutine fires inline
-	// API fallback calls on a pack miss so translations overlap either way.
-	// -o (apiOnly) skips XDG entirely and always hits the network APIs.
+	// ── Phase 1: parallel — EN-word resolution + target-language translations ─
 	var (
-		entry      *LexEntry
-		defn       *Definition
-		synSource  []string
-		etym       string
+		defn      *Definition
+		synSource []string
+		etym      string
 		wordTrans  = make([]*Translation, len(translateLangs))
 		tWordTrans = make([]time.Duration, len(translateLangs))
-		tEmbed     time.Duration
-		tAPI       time.Duration
-		tAPIEtym   time.Duration
 	)
-	var (
-		apiDefn           *Definition
-		apiEtym           string
-		resolvedEN        string        // set when input is non-EN and routed through an EN translation
-		apiFallback       bool          // set when pack miss forces an API call
-		p1XDGHit          bool          // true only when Phase-1 XDG goroutine itself found the entry
-		resolveInP1       bool          // true when GTX resolve ran inside Phase-1 goroutine
-		tResolve          time.Duration // time for fetchGTX non-EN resolve call
-		tResolveXDG       time.Duration // time for lookupEN(resolvedEN)
-		tResolveDefn      time.Duration // time for fetchDefinition(resolvedEN) fallback
-		tP1GoroutineTotal time.Duration // total wall time of the hintNonEN Phase-1 goroutine
-	)
+	// rs collects all Phase-1 resolution results (entry, timings, flags).
+	var rs resolveState
 
 	// synTargets and wg2 are declared here so trans goroutines can chain
 	// syns lookups immediately after the translation result arrives,
@@ -1886,165 +2183,20 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 		tSynTargets   = make([]time.Duration, len(translateLangs))
 		synPackHits   = make([]bool, len(translateLangs))
 		targetEntries = make([]*LexEntry, len(translateLangs))
-		wikiResults   = make([]wikiResult, len(translateLangs)) // per-lang wiki fetch results
+		wikiResults   = make([]wikiResult, len(translateLangs))
 	)
 	var wg2 sync.WaitGroup
 
 	useXDG := !apiOnly && enProvider != nil
 
 	var wg1 sync.WaitGroup
-	wg1.Add(len(translateLangs))
+	wg1.Add(len(translateLangs) + 1) // +1 for the Phase-1 EN-word resolution goroutine
 	if hintNonEN {
 		// User declared the word is non-EN (e.g. `lexify einheitlich en`).
 		// Resolve via GTX in Phase 1, parallel with any translation goroutines.
-		// Never look up the raw non-EN word in XDG or the definition API.
-		wg1.Add(1)
-		go func() {
-			defer wg1.Done()
-			tStart := time.Now()
-			tR := time.Now()
-			enTrans, _ := fetchGTX(word, "en")
-			tResolve = time.Since(tR)
-			if enTrans != nil {
-				resolveInP1 = true
-				resolvedEN = enTrans.Word
-				if useXDG {
-					tR2 := time.Now()
-					if e := lookupEN(enTrans.Word); e != nil {
-						tResolveXDG = time.Since(tR2)
-						entry = e
-						p1XDGHit = true
-					} else {
-						tResolveXDG = time.Since(tR2)
-						// XDG miss for resolved word: fall back to API.
-						var wgFB sync.WaitGroup
-						wgFB.Add(2)
-						go func() {
-							defer wgFB.Done()
-							tR3 := time.Now()
-							apiDefn = fetchDefinition(enTrans.Word)
-							tResolveDefn = time.Since(tR3)
-							if apiDefn != nil {
-								apiFallback = true
-							}
-						}()
-						go func() {
-							defer wgFB.Done()
-							apiEtym = fetchEtymologyWiki(enTrans.Word)
-						}()
-						wgFB.Wait()
-					}
-				} else {
-					// apiOnly or no pack: query API for the resolved EN word directly.
-					var wgFB sync.WaitGroup
-					wgFB.Add(2)
-					go func() {
-						defer wgFB.Done()
-						tR3 := time.Now()
-						apiDefn = fetchDefinition(enTrans.Word)
-						tResolveDefn = time.Since(tR3)
-					}()
-					go func() {
-						defer wgFB.Done()
-						apiEtym = fetchEtymologyWiki(enTrans.Word)
-					}()
-					wgFB.Wait()
-				}
-			} else {
-				// GTX returned nil — the word is already English; look it up directly.
-				if useXDG {
-					t := time.Now()
-					entry = lookupEN(word)
-					tEmbed = time.Since(t)
-					if entry != nil {
-						p1XDGHit = true
-					} else {
-						var wgFB sync.WaitGroup
-						wgFB.Add(2)
-						go func() {
-							defer wgFB.Done()
-							t2 := time.Now()
-							apiDefn = fetchDefinition(word)
-							tAPI = time.Since(t2)
-							if apiDefn != nil {
-								apiFallback = true
-							}
-						}()
-						go func() {
-							defer wgFB.Done()
-							t2 := time.Now()
-							apiEtym = fetchEtymologyWiki(word)
-							tAPIEtym = time.Since(t2)
-						}()
-						wgFB.Wait()
-					}
-				} else {
-					var wgFB sync.WaitGroup
-					wgFB.Add(2)
-					go func() {
-						defer wgFB.Done()
-						t2 := time.Now()
-						apiDefn = fetchDefinition(word)
-						tAPI = time.Since(t2)
-					}()
-					go func() {
-						defer wgFB.Done()
-						t2 := time.Now()
-						apiEtym = fetchEtymologyWiki(word)
-						tAPIEtym = time.Since(t2)
-					}()
-					wgFB.Wait()
-				}
-			}
-			tP1GoroutineTotal = time.Since(tStart)
-		}()
-	} else if useXDG {
-		wg1.Add(1)
-		go func() {
-			defer wg1.Done()
-			t := time.Now()
-			entry = lookupEN(word)
-			tEmbed = time.Since(t)
-			if entry != nil {
-				p1XDGHit = true
-			} else {
-				// Pack miss — fall back to API while translations are still in flight.
-				var wgFB sync.WaitGroup
-				wgFB.Add(2)
-				go func() {
-					defer wgFB.Done()
-					t2 := time.Now()
-					apiDefn = fetchDefinition(word)
-					tAPI = time.Since(t2)
-				}()
-				go func() {
-					defer wgFB.Done()
-					t2 := time.Now()
-					apiEtym = fetchEtymologyWiki(word)
-					tAPIEtym = time.Since(t2)
-				}()
-				wgFB.Wait()
-				if apiDefn != nil {
-					apiFallback = true
-				}
-			}
-		}()
+		go func() { defer wg1.Done(); rs = resolveNonENWord(word, useXDG) }()
 	} else {
-		// API-only: default when no pack installed, or when -o is passed.
-		// Total Phase-1 cost = max(defn_rtt, etym_rtt, trans_rtt).
-		wg1.Add(2)
-		go func() {
-			defer wg1.Done()
-			t := time.Now()
-			apiDefn = fetchDefinition(word)
-			tAPI = time.Since(t)
-		}()
-		go func() {
-			defer wg1.Done()
-			t := time.Now()
-			apiEtym = fetchEtymologyWiki(word)
-			tAPIEtym = time.Since(t)
-		}()
+		go func() { defer wg1.Done(); rs = resolveWordXDGOrAPI(word, useXDG) }()
 	}
 	for i, lang := range translateLangs {
 		i, lang := i, lang
@@ -2142,16 +2294,16 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	}
 	wg1.Wait()
 
-	// Populate defn/synSource/etym from XDG entry or parallel API results.
-	if entry != nil {
-		defn = &Definition{Phonetic: entry.IPA, Meanings: entry.Meanings}
-		synSource = entry.Syns
-		etym = entry.Etym
+	// Populate defn/synSource/etym from Phase-1 results.
+	if rs.entry != nil {
+		defn = &Definition{Phonetic: rs.entry.IPA, Meanings: rs.entry.Meanings}
+		synSource = rs.entry.Syns
+		etym = rs.entry.Etym
 	} else {
-		if apiDefn != nil {
-			defn = apiDefn
+		if rs.apiDefn != nil {
+			defn = rs.apiDefn
 		}
-		etym = apiEtym
+		etym = rs.apiEtym
 	}
 
 	// Non-EN source word routing: if lookup missed, try treating the input as a
@@ -2160,34 +2312,34 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	// unconditionally — no detectedSrc guard needed. This also covers the case
 	// where the only target lang is "en" (fetchTranslation short-circuits to nil
 	// for that lang, so wordTrans[0] would be nil and Detected would be unavailable).
-	if entry == nil && defn == nil && resolvedEN == "" {
-		tR := time.Now()
+	if rs.entry == nil && defn == nil && rs.resolvedEN == "" {
+		t := time.Now()
 		enTrans, _ := fetchGTX(word, "en")
-		tResolve = time.Since(tR)
+		rs.tResolve = time.Since(t)
 		if enTrans != nil {
-			resolvedEN = enTrans.Word
+			rs.resolvedEN = enTrans.Word
 			if !apiOnly && enProvider != nil {
-				tR2 := time.Now()
+				t2 := time.Now()
 				if e := lookupEN(enTrans.Word); e != nil {
-					tResolveXDG = time.Since(tR2)
-					entry = e
+					rs.tResolveXDG = time.Since(t2)
+					rs.entry = e
 					defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
 					synSource = e.Syns
 					etym = e.Etym
 				} else {
-					tResolveXDG = time.Since(tR2)
+					rs.tResolveXDG = time.Since(t2)
 				}
 			}
-			if entry == nil {
-				tR3 := time.Now()
+			if rs.entry == nil {
+				t3 := time.Now()
 				if d := fetchDefinition(enTrans.Word); d != nil {
-					tResolveDefn = time.Since(tR3)
+					rs.tResolveDefn = time.Since(t3)
 					defn = d
 					if !apiOnly && enProvider != nil {
-						apiFallback = true
+						rs.apiFallback = true
 					}
 				} else {
-					tResolveDefn = time.Since(tR3)
+					rs.tResolveDefn = time.Since(t3)
 				}
 			}
 		}
@@ -2295,204 +2447,49 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 
 	var fetchLog []string
 	if debug {
-		maxDur := func(ds ...time.Duration) time.Duration {
-			var m time.Duration
-			for _, d := range ds {
-				if d > m {
-					m = d
-				}
-			}
-			return m
-		}
-		row := func(label string, ms int64, src string) string {
-			srcStr := ""
-			if src != "" {
-				srcStr = "  " + src
-			}
-			return fmt.Sprintf("│  %-12s %5dms%s", label, ms, srcStr)
-		}
-		header := func(phase string, total time.Duration) string {
-			return fmt.Sprintf("├─ %s (%dms) %s", phase, total.Milliseconds(),
-				strings.Repeat("─", max(0, 27-len(phase)-len(fmt.Sprintf("(%dms)", total.Milliseconds())))))
-		}
-
-		// Phase 1 wall time = max of all parallel tasks in wg1.
-		var p1Durations []time.Duration
-		if hintNonEN {
-			p1Durations = append(p1Durations, tP1GoroutineTotal)
-		} else if useXDG {
-			p1Durations = append(p1Durations, tEmbed)
-			if !p1XDGHit {
-				// Pack miss: inline API fallback also ran inside Phase 1.
-				p1Durations = append(p1Durations, tAPI, tAPIEtym)
-			}
-		} else {
-			p1Durations = append(p1Durations, tAPI, tAPIEtym)
-		}
-		for _, d := range tWordTrans {
-			p1Durations = append(p1Durations, d)
-		}
-		p1Total := maxDur(p1Durations...)
-
-		// Phase 2 wall time = max of all parallel tasks in wg2.
-		var p2Durations []time.Duration
-		for _, d := range tSynTargets {
-			p2Durations = append(p2Durations, d)
-		}
-		for _, d := range tTargetDefnFallback {
-			p2Durations = append(p2Durations, d)
-		}
-		for _, d := range tTargetEtymFallback {
-			p2Durations = append(p2Durations, d)
-		}
-		p2Total := maxDur(p2Durations...)
-
-		var p1, p2 []string
-		for i, lang := range translateLangs {
-			src := ""
-			if wordTrans[i] != nil {
-				src = wordTrans[i].Source
-			}
-			p1 = append(p1, row("trans("+lang+")", tWordTrans[i].Milliseconds(), src))
-		}
-		if !resolveInP1 {
-			// Word lookup happened in Phase 1 (or didn't happen yet): show it.
-			if p1XDGHit {
-				p1 = append(p1, row("syns(en)", tEmbed.Milliseconds(), "xdg"))
-			} else if useXDG {
-				// Pack was queried but missed; inline API fallback fired inside the goroutine.
-				p1 = append(p1, row("syns(en)", tEmbed.Milliseconds(), "xdg miss"))
-				if tAPI > 0 {
-					p1 = append(p1, row("defn", tAPI.Milliseconds(), "api"))
-				}
-				if etym != "" && tAPIEtym > 0 {
-					p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
-				}
-			} else {
-				p1 = append(p1, row("defn", tAPI.Milliseconds(), "api"))
-				if etym != "" {
-					p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
-				}
-			}
-		}
-
-		// Resolve step: non-EN word routed through GTX → EN then XDG/API.
-		var pResolve []string
-		if tResolve > 0 {
-			pResolve = append(pResolve, row("gtx→en", tResolve.Milliseconds(), "gtx"))
-			if tResolveXDG > 0 {
-				pResolve = append(pResolve, row("syns(en)", tResolveXDG.Milliseconds(), "xdg"))
-			}
-			if tResolveDefn > 0 {
-				pResolve = append(pResolve, row("defn", tResolveDefn.Milliseconds(), "api"))
-			}
-		}
-		for i, lang := range translateLangs {
-			hasEntry := i < len(targetEntries) && targetEntries[i] != nil
-			if hasEntry {
-				e := targetEntries[i]
-				// Definitions: for non-EN targets, source is lang.wiktionary.org (wiki);
-				// for EN targets, source is the EN pack (xdg).
-				var defnSrc string
-				defnMs := tSynTargets[i].Milliseconds()
-				if lang == "en" {
-					defnSrc = "xdg"
-					if len(e.Meanings) == 0 {
-						defnSrc = "xdg miss"
-					}
-				} else {
-					if i < len(wikiResults) && len(wikiResults[i].Meanings) > 0 {
-						defnSrc = "wiki"
-					} else if i < len(targetDefnFallback) && targetDefnFallback[i] != "" {
-						defnSrc = "wiki miss→gtx~"
-						defnMs = tTargetDefnFallback[i].Milliseconds()
-					} else {
-						defnSrc = "wiki miss"
-					}
-				}
-				// Etymology: for EN targets: xdg → gtx~.
-				//           for non-EN targets: wiki → gtx~ (pack etym is always English).
-				var etymSrc string
-				etymMs := int64(0)
-				etymFromWiki := i < len(wikiResults) && wikiResults[i].EtymFromWiki
-				if e.Etym != "" && !etymFromWiki {
-					etymSrc = "xdg"
-				} else if etymFromWiki {
-					etymSrc = "wiki"
-				} else if i < len(targetEtymFallback) && targetEtymFallback[i] != "" {
-					if lang == "en" {
-						etymSrc = "xdg miss→gtx~"
-					} else {
-						etymSrc = "wiki miss→gtx~"
-					}
-					etymMs = tTargetEtymFallback[i].Milliseconds()
-				} else {
-					if lang == "en" {
-						etymSrc = "xdg miss"
-					} else {
-						etymSrc = "wiki miss"
-					}
-				}
-				p2 = append(p2, row("defn("+lang+")", defnMs, defnSrc))
-				p2 = append(p2, row("etym("+lang+")", etymMs, etymSrc))
-			} else {
-				// No pack or wiki entry — if GTX fallback ran, still surface it.
-				if i < len(targetDefnFallback) && targetDefnFallback[i] != "" {
-					p2 = append(p2, row("defn("+lang+")", tTargetDefnFallback[i].Milliseconds(), "gtx~"))
-				}
-				if i < len(targetEtymFallback) && targetEtymFallback[i] != "" {
-					p2 = append(p2, row("etym("+lang+")", tTargetEtymFallback[i].Milliseconds(), "gtx~"))
-				}
-			}
-			if tSynTargets[i] > 0 || synPackHits[i] {
-				synSrc := "api"
-				if synPackHits[i] {
-					synSrc = "xdg"
-				} else if lang != "en" {
-					// Syns came from wiki fetch (same round-trip as definitions).
-					synSrc = "wiki"
-					if !hasEntry {
-						synSrc = "api" // no pack entry and no wiki entry — pure API
-					}
-				}
-				p2 = append(p2, row("syns("+lang+")", 0, synSrc))
-			}
-		}
-		if len(p1) > 0 || len(pResolve) > 0 {
-			fetchLog = append(fetchLog, "┌"+strings.Repeat("─", 33))
-			if len(p1) > 0 {
-				fetchLog = append(fetchLog, header("phase 1", p1Total))
-				fetchLog = append(fetchLog, p1...)
-			}
-			if len(pResolve) > 0 {
-				resolveTotal := tResolve + tResolveXDG + tResolveDefn
-				fetchLog = append(fetchLog, header("resolve", resolveTotal))
-				fetchLog = append(fetchLog, pResolve...)
-			}
-			if len(p2) > 0 {
-				fetchLog = append(fetchLog, header("phase 2", p2Total))
-				fetchLog = append(fetchLog, p2...)
-			}
-			fetchLog = append(fetchLog, "└"+strings.Repeat("─", 33))
-		}
+		fetchLog = buildFetchLog(debugTimingParams{
+			hintNonEN:           hintNonEN,
+			useXDG:              useXDG,
+			p1XDGHit:            rs.p1XDGHit,
+			resolveInP1:         rs.resolveInP1,
+			tEmbed:              rs.tEmbed,
+			tAPI:                rs.tAPI,
+			tAPIEtym:            rs.tAPIEtym,
+			tResolve:            rs.tResolve,
+			tResolveXDG:         rs.tResolveXDG,
+			tResolveDefn:        rs.tResolveDefn,
+			tP1GoroutineTotal:   rs.tP1Total,
+			tWordTrans:          tWordTrans,
+			tSynTargets:         tSynTargets,
+			tTargetDefnFallback: tTargetDefnFallback,
+			tTargetEtymFallback: tTargetEtymFallback,
+			translateLangs:      translateLangs,
+			wordTrans:           wordTrans,
+			etym:                etym,
+			targetEntries:       targetEntries,
+			wikiResults:         wikiResults,
+			targetDefnFallback:  targetDefnFallback,
+			targetEtymFallback:  targetEtymFallback,
+			synPackHits:         synPackHits,
+		})
 	}
 
 	render(RenderInput{
-		Word:          word,
-		ResolvedEN:    resolvedEN,
-		APIFallback:   apiFallback,
-		TargetLangs:   translateLangs,
-		Defn:          defn,
-		SynSource:     synSource,
-		Etym:          etym,
-		Translations:  wordTrans,
+		Word:               word,
+		ResolvedEN:         rs.resolvedEN,
+		APIFallback:        rs.apiFallback,
+		TargetLangs:        translateLangs,
+		Defn:               defn,
+		SynSource:          synSource,
+		Etym:               etym,
+		Translations:       wordTrans,
 		SynTargets:         synTargets,
 		TargetEntries:      targetEntries,
 		TargetDefnFallback: targetDefnFallback,
 		TargetEtymFallback: targetEtymFallback,
 		Warnings:           warnings,
-		Elapsed:       time.Since(start),
-		FetchLog:      fetchLog,
+		Elapsed:            time.Since(start),
+		FetchLog:           fetchLog,
 	})
 }
 

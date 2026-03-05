@@ -2299,7 +2299,7 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXE
 						needsWiki := !isNativeLangPack(lang) ||
 							packEntry == nil ||
 							len(packEntry.Meanings) == 0 ||
-							packEntry.Etym == ""
+							(!noGTXEty && packEntry.Etym == "")
 						if needsWiki {
 							tWiki := time.Now()
 							wr = fetchTargetWikiData(translated, lang)

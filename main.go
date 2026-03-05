@@ -109,7 +109,7 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 // stripANSI removes all ANSI escape sequences, returning the bare visible text.
 func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
 
-// clearLine erases the current terminal line and parks the cursor at column 0.
+// "line wrap fix": clearLine erases the current terminal line and parks the cursor at column 0.
 // Must be called at the start of every function that produces stdout output so
 // that residual content (shell prompt, progress text) does not bleed into the
 // first output line.
@@ -150,6 +150,19 @@ func divider() string {
 
 func sectionHeader(icon, title string) string {
 	return fmt.Sprintf("\n  %s%s%s%s\n", CHead, Bold, icon+title, R)
+}
+
+// printFlagLine prints "  coloredPrefix  desc", wrapping desc at dividerWidth
+// when the combined visible length exceeds it. Wrapped continuation lines use
+// a fixed 4-space indent so they remain readable on narrow terminals.
+func printFlagLine(coloredPrefix, desc string) {
+	visPrefix := "  " + stripANSI(coloredPrefix) + "  "
+	if runeLen(visPrefix+desc) <= dividerWidth {
+		fmt.Printf("  %s  %s\n", coloredPrefix, desc)
+	} else {
+		fmt.Printf("  %s\n", coloredPrefix)
+		fmt.Println(wordWrap(desc, dividerWidth, "    "))
+	}
 }
 
 // mentionTemplates: structure is {{name|lang|word|gloss?}} — word is parts[2]
@@ -1812,7 +1825,7 @@ func printHelp() {
 	for _, line := range art {
 		fmt.Printf("%s%s%s%s\n", CWord, Bold, line, R)
 	}
-	fmt.Printf("  %sword lookup: definition · synonyms · etymology · translation%s\n", CEx, R)
+	fmt.Printf("%s%s%s\n", CEx, wordWrap("word lookup: definition · synonyms · etymology · translation", dividerWidth, "  "), R)
 	fmt.Println(divider())
 	fmt.Println()
 
@@ -1822,24 +1835,26 @@ func printHelp() {
 	fmt.Printf("  %slexify%s %s<word>%s %s<lang> <lang>%s %s...%s\n\n", CPos, R, CSyn, R, CTrans, R, CEx, R)
 
 	fmt.Printf("  %s%sFLAGS%s\n", CHead, Bold, R)
-	fmt.Printf("  %s-i <lang> [lang ...]%s  install offline pack  (e.g. lexify -i en de ru)\n", CPos, R)
-	fmt.Printf("  %s  --kaikki%s  source: kaikki.org JSONL  ~200–500 MB  %s(default; native editions for de fr es it pt ru ja zh ko nl pl tr)%s\n", CPos, R, Dim, R)
-	fmt.Printf("  %s  --wiki%s   source: en.wiktionary.org XML dump  ~1.2 GB, ~10 min\n", CPos, R)
-	fmt.Printf("  %s  --force%s  reinstall even if pack is already up to date\n", CPos, R)
-	fmt.Printf("  %s-o%s         force live API (skip installed pack)\n", CPos, R)
-	fmt.Printf("  %s-d%s         show per-fetch debug timing\n", CPos, R)
-	fmt.Printf("  %s--force-ety%s   use GTX~ as etymology fallback when pack/wiki miss\n\n", CPos, R)
+	printFlagLine(fmt.Sprintf("%s-i <lang> [lang ...]%s", CPos, R), "install offline pack  (e.g. lexify -i en de ru)")
+	printFlagLine(fmt.Sprintf("  %s--kaikki%s", CPos, R), "source: kaikki.org JSONL  ~200-500 MB  (default; native editions for de fr es it pt ru ja zh ko nl pl tr)")
+	printFlagLine(fmt.Sprintf("  %s--wiki%s", CPos, R), "source: en.wiktionary.org XML dump  ~1.2 GB, ~10 min")
+	printFlagLine(fmt.Sprintf("  %s--force%s", CPos, R), "reinstall even if pack is already up to date")
+	printFlagLine(fmt.Sprintf("%s-o%s", CPos, R), "force live API (skip installed pack)")
+	printFlagLine(fmt.Sprintf("%s-d%s", CPos, R), "show per-fetch debug timing")
+	printFlagLine(fmt.Sprintf("%s--force-ety%s", CPos, R), "use GTX~ as etymology fallback when pack/wiki miss")
+	fmt.Println()
 
 	fmt.Printf("  %s%sEXAMPLES%s\n", CHead, Bold, R)
 	examples := [][2]string{
 		{"lexify serendipity", "English definition, synonyms, etymology"},
-		{"lexify serendipity fr", "+ translation to French, content in French"},
-		{"lexify serendipity fr ru", "+ translations to French and Russian"},
-		{"lexify Schadenfreude en", "non-English source word, translate to English"},
+		{"lexify serendipity fr", "adds French translation and content"},
+		{"lexify serendipity fr ru", "adds French and Russian translations"},
+		{"lexify Schadenfreude", "non-English input, resolves via English Wiktionary"},
 	}
 	for _, ex := range examples {
 		fmt.Printf("  %s%s%s\n", CPos, ex[0], R)
-		fmt.Printf("    %s→ %s%s\n\n", CEx, ex[1], R)
+		wrapped := wordWrap(ex[1], dividerWidth, "      ")
+		fmt.Printf("    %s→ %s%s\n\n", CEx, strings.TrimPrefix(wrapped, "      "), R)
 	}
 
 	fmt.Printf("  %s%sLANGUAGES%s\n", CHead, Bold, R)

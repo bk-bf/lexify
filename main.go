@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -72,6 +73,11 @@ const (
 	IDef   = "\uf02d "
 	ISyn   = "\uf0ca "
 	IEty   = "\uf017 "
+
+	// minEtymRunes is the minimum rune length a wiki-sourced etymology string must
+	// have to be shown. Shorter results are fragments/stubs; GTX~ will be tried instead.
+	minEtymRunes = 40
+
 	ITrans = "\uf0ac "
 )
 
@@ -262,6 +268,13 @@ func resolveTemplate(raw string) string {
 		return ""
 	}
 
+	// Namespace transclusion templates (name contains ":") are always resolved
+	// from a separate wiki page — their arguments are metadata/flags (e.g. "да"),
+	// never inline content. Drop entirely.
+	if strings.Contains(name, ":") {
+		return ""
+	}
+
 	// Single-argument templates not otherwise handled: return the argument as-is
 	// Covers things like {{lang|word}}, {{smallcaps|word}}, etc.
 	if len(parts) == 2 {
@@ -281,7 +294,15 @@ func resolveTemplate(raw string) string {
 // [[link|display]]      → display
 // [[link]]              → link
 // ”italic”, ”'bold”' markers removed
+// danglingConnectorRe matches etymology text that ends with an incomplete fragment
+// after template removal — a connector/preposition with nothing meaningful after it.
+// These are left when a transclusion template resolved to empty.
+var danglingConnectorRe = regexp.MustCompile(
+	`(?i)(?:^|\.)\s*[\p{L} ]*(от|из|далее из|далее|von|aus|de|da|from|of|del|della|di|du|der|dem|den|des|af|van|fr\S*|fra|further from)\s*$`)
+
 func stripWikitext(text string) string {
+	// Decode HTML entities (&nbsp; → " ", &amp; → "&", &#160; → " ", etc.)
+	text = html.UnescapeString(text)
 	// Strip HTML comments <!-- ... -->
 	text = regexp.MustCompile(`(?s)<!--.*?-->`).ReplaceAllString(text, "")
 	// Strip <ref>...</ref> and self-closing <ref ... />  (footnote citations)
@@ -318,7 +339,13 @@ func stripWikitext(text string) string {
 	// tidy up spacing artefacts from removed templates
 	text = regexp.MustCompile(` {2,}`).ReplaceAllString(text, " ")
 	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
-	return strings.TrimSpace(text)
+	text = strings.TrimSpace(text)
+	// Remove dangling connector/preposition fragments left when a transclusion
+	// template resolved to empty (e.g. RU "Происходит от" with no continuation).
+	if danglingConnectorRe.MatchString(text) {
+		return ""
+	}
+	return text
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -2054,11 +2081,15 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 					}
 
 					// Build synthetic entry.
-					// Priority for each field: XDG pack → lang.wiktionary.org → (GTX~ fires later).
+					// IPA and syns from pack are language-neutral so always preferred.
+					// Etym from pack is sourced from en.wiktionary.org (always English),
+					// so for non-EN targets we use wiki etym instead.
 					synthetic := &LexEntry{}
 					if packEntry != nil {
 						synthetic.IPA = packEntry.IPA
-						synthetic.Etym = packEntry.Etym
+						if lang == "en" {
+							synthetic.Etym = packEntry.Etym
+						}
 						if len(packEntry.Syns) > 0 {
 							synthetic.Syns = packEntry.Syns
 							synTargets[i] = packEntry.Syns
@@ -2067,7 +2098,17 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 					}
 					if lang != "en" {
 						synthetic.Meanings = wr.Meanings
-						if synthetic.Etym == "" && wr.Etym != "" {
+						// Accept wiki etym only when it is long enough to be a real
+						// etymology. Many non-EN Wiktionary pages store their etymology
+						// in a separate transclusion template (e.g. RU
+						// {{этимология:бить|да}}) that we cannot resolve without an
+						// extra API call. When that template is missing or empty, what
+						// survives after stripping is a dangling fragment like
+						// "Происходит от" — technically non-empty but useless.
+						// Gating on minEtymRunes discards those stubs and leaves
+						// synthetic.Etym empty, which causes needsEtym=true and the
+						// GTX~ fallback to fire in the next pass.
+						if runeLen(wr.Etym) >= minEtymRunes {
 							synthetic.Etym = wr.Etym
 							wr.EtymFromWiki = true
 						}
@@ -2357,7 +2398,8 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 						defnSrc = "wiki miss"
 					}
 				}
-				// Etymology: XDG pack → wiki → gtx~.
+				// Etymology: for EN targets: xdg → gtx~.
+				//           for non-EN targets: wiki → gtx~ (pack etym is always English).
 				var etymSrc string
 				etymMs := int64(0)
 				etymFromWiki := i < len(wikiResults) && wikiResults[i].EtymFromWiki
@@ -2366,10 +2408,18 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 				} else if etymFromWiki {
 					etymSrc = "wiki"
 				} else if i < len(targetEtymFallback) && targetEtymFallback[i] != "" {
-					etymSrc = "xdg miss→gtx~"
+					if lang == "en" {
+						etymSrc = "xdg miss→gtx~"
+					} else {
+						etymSrc = "wiki miss→gtx~"
+					}
 					etymMs = tTargetEtymFallback[i].Milliseconds()
 				} else {
-					etymSrc = "xdg miss"
+					if lang == "en" {
+						etymSrc = "xdg miss"
+					} else {
+						etymSrc = "wiki miss"
+					}
 				}
 				p2 = append(p2, row("defn("+lang+")", defnMs, defnSrc))
 				p2 = append(p2, row("etym("+lang+")", etymMs, etymSrc))

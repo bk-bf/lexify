@@ -676,7 +676,7 @@ func parsePOSSection(pos, text string) *Meaning {
 			}
 		}
 	}
-	return &Meaning{POS: pos, Defs: defs, Syns: syns}
+	return &Meaning{POS: normalizePOS(pos), Defs: defs, Syns: syns}
 }
 
 // parseSynSection extracts synonym words from a Wiktionary Synonyms section.
@@ -861,7 +861,7 @@ func convertKEntry(k kEntry) (string, LexEntry) {
 	}
 	var meanings []Meaning
 	if pos != "" && len(defs) > 0 {
-		meanings = append(meanings, Meaning{POS: pos, Defs: defs, Syns: senseSyns})
+		meanings = append(meanings, Meaning{POS: normalizePOS(pos), Defs: defs, Syns: senseSyns})
 	}
 	etym := trimEtym(stripWikitext(strings.TrimSpace(k.EtymologyText)))
 	return key, LexEntry{IPA: ipa, Meanings: meanings, Syns: senseSyns, Etym: etym}
@@ -902,7 +902,7 @@ func fetchDefinition(word string) *Definition {
 		if i >= 3 {
 			break
 		}
-		meaning := Meaning{POS: m.PartOfSpeech}
+		meaning := Meaning{POS: normalizePOS(m.PartOfSpeech)}
 		for j, def := range m.Definitions {
 			if j >= 3 {
 				break
@@ -1437,9 +1437,10 @@ func printHelp() {
 	fmt.Printf("  %slexify%s %s<word>%s %s<lang> <lang>%s %s...%s\n\n", CPos, R, CSyn, R, CTrans, R, CEx, R)
 
 	fmt.Printf("  %s%sFLAGS%s\n", CHead, Bold, R)
-	fmt.Printf("  %s-i <lang>%s  install offline pack  (e.g. lexify -i en)\n", CPos, R)
+	fmt.Printf("  %s-i <lang> [lang ...]%s  install offline pack  (e.g. lexify -i en de ru)\n", CPos, R)
 	fmt.Printf("  %s  --kaikki%s  source: kaikki.org JSONL  ~500 MB, ~2 min  %s(default)%s\n", CPos, R, Dim, R)
 	fmt.Printf("  %s  --wiki%s   source: en.wiktionary.org XML dump  ~1.2 GB, ~10 min\n", CPos, R)
+	fmt.Printf("  %s  --force%s  reinstall even if pack is already up to date\n", CPos, R)
 	fmt.Printf("  %s-o%s         force live API (skip installed pack)\n", CPos, R)
 	fmt.Printf("  %s-d%s         show per-fetch debug timing\n\n", CPos, R)
 
@@ -1497,6 +1498,41 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// normalizePOS maps abbreviated and variant POS labels (from kaikki JSONL) to their
+// full English equivalents used by the API, so both sources render identically.
+var posNorm = map[string]string{
+	"adj":         "adjective",
+	"adv":         "adverb",
+	"n":           "noun",
+	"v":           "verb",
+	"prep":        "preposition",
+	"pron":        "pronoun",
+	"conj":        "conjunction",
+	"interj":      "interjection",
+	"num":         "numeral",
+	"det":         "determiner",
+	"abbrev":      "abbreviation",
+	"name":        "proper noun",
+	"particle":    "particle",
+	"phrase":      "phrase",
+	"prefix":      "prefix",
+	"suffix":      "suffix",
+	"affix":       "affix",
+	"punct":       "punctuation",
+	"character":   "character",
+	"symbol":      "symbol",
+	"contraction": "contraction",
+	"proverb":     "proverb",
+}
+
+func normalizePOS(pos string) string {
+	l := strings.ToLower(strings.TrimSpace(pos))
+	if full, ok := posNorm[l]; ok {
+		return full
+	}
+	return l
 }
 
 // ── Orchestration ─────────────────────────────────────────────────────────────
@@ -1977,7 +2013,7 @@ func (pr *progressReader) Read(b []byte) (int, error) {
 
 // cmdInstall downloads and indexes a language pack for offline use.
 // source is "kaikki" (default, fast ~500 MB JSONL) or "wiki" (~1.2 GB XML dump).
-func cmdInstall(lang, source string) {
+func cmdInstall(lang, source string, force bool) {
 	langName, ok := langNames[lang]
 	if !ok {
 		fmt.Fprintf(os.Stderr, "lexify -i: unsupported language %q\n  supported: en de fr es it pt ru ja zh ko nl pl sv ar tr uk hi\n", lang)
@@ -2015,10 +2051,11 @@ func cmdInstall(lang, source string) {
 		if remoteLastMod != "" {
 			if existing, err := os.ReadFile(verPath); err == nil {
 				exStr := string(existing)
-				if strings.Contains(exStr, "source: "+dlURL) &&
+				if !force &&
+					strings.Contains(exStr, "source: "+dlURL) &&
 					strings.Contains(exStr, "last-modified: "+remoteLastMod) {
 					if _, err := os.Stat(idxPath); err == nil {
-						fmt.Printf("\n  %s%s%s pack is already up to date (%s).\n\n",
+						fmt.Printf("\n  %s%s%s pack is already up to date (%s).\n  Run with --force to reinstall.\n\n",
 							Bold+CSyn, strings.ToUpper(lang), R, remoteLastMod)
 						return
 					}
@@ -2194,7 +2231,7 @@ func cmdInstall(lang, source string) {
 	ver := fmt.Sprintf("source: %s\nbuilt:  %s\nlast-modified: %s\n", dlURL, time.Now().Format(time.RFC3339), remoteLastMod)
 	os.WriteFile(verPath, []byte(ver), 0o644) //nolint
 
-	fmt.Printf("\n  %s%s pack installed.%s  run 'lexify <word> -o' to use it.\n\n",
+	fmt.Printf("\n  %s%s pack installed.%s\n\n",
 		Bold+CSyn, strings.ToUpper(lang), R)
 }
 
@@ -2205,24 +2242,38 @@ func main() {
 		printHelp()
 		return
 	}
-	// Check for -i/--install flag anywhere in args (e.g. lexify -i en, lexify -i en --wiki)
+	// Check for -i/--install flag anywhere in args (e.g. lexify -i en de ru --force)
 	args := os.Args[1:]
 	for j, a := range args {
 		if a == "-i" || a == "--install" {
 			if j+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "usage: lexify -i <lang> [--kaikki|--wiki]")
+				fmt.Fprintln(os.Stderr, "usage: lexify -i <lang> [lang ...] [--kaikki|--wiki] [--force]")
 				os.Exit(1)
 			}
-			lang := strings.ToLower(strings.TrimSpace(args[j+1]))
-			source := "kaikki" // default: fast ~500MB JSONL
-			for _, flag := range args[j+2:] {
-				if flag == "--kaikki" {
+			source := "kaikki"
+			force := false
+			var langs []string
+			for _, arg := range args[j+1:] {
+				switch arg {
+				case "--kaikki":
 					source = "kaikki"
-				} else if flag == "--wiki" {
+				case "--wiki":
 					source = "wiki"
+				case "--force":
+					force = true
+				default:
+					if !strings.HasPrefix(arg, "-") {
+						langs = append(langs, strings.ToLower(strings.TrimSpace(arg)))
+					}
 				}
 			}
-			cmdInstall(lang, source)
+			if len(langs) == 0 {
+				fmt.Fprintln(os.Stderr, "usage: lexify -i <lang> [lang ...] [--kaikki|--wiki] [--force]")
+				os.Exit(1)
+			}
+			for _, lang := range langs {
+				cmdInstall(lang, source, force)
+			}
 			return
 		}
 	}

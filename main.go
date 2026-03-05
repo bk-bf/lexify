@@ -40,7 +40,6 @@ const (
 	CSyn   = "\033[36m"   // cyan        — synonyms
 	CTrans = "\033[1;34m" // bold blue   — translated word
 	CEx    = "\033[37m"   // light grey  — examples / meta
-	//lint:ignore U1000 kept for completeness
 	CErr = "\033[31m"       // red — errors
 	CBar = "\033[38;5;208m" // orange — install progress bar
 )
@@ -355,11 +354,6 @@ type LexEntry struct {
 	Etym     string
 }
 
-// LookupProvider abstracts over the embedded EN pack and user-installed packs.
-type LookupProvider interface {
-	Lookup(word string) *LexEntry // nil on miss
-}
-
 // xdgDataDir returns ~/.local/share/lexify (or $XDG_DATA_HOME/lexify).
 func xdgDataDir() string {
 	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
@@ -369,7 +363,7 @@ func xdgDataDir() string {
 	return filepath.Join(home, ".local", "share", "lexify")
 }
 
-// installedPack is the LookupProvider backed by a user-installed pack on disk.
+// installedPack is the offline lookup provider backed by a user-installed pack on disk.
 // Pack format (written by cmdInstall):
 //
 //	lang.idx — sorted fixed-size records: [32-byte key, zero-padded][8-byte offset, big-endian]
@@ -453,18 +447,18 @@ func (p *installedPack) Lookup(word string) *LexEntry {
 	return nil
 }
 
-// enProvider is the active EN LookupProvider, backed by a user-installed XDG pack.
+// enProvider is the active EN pack, backed by a user-installed XDG pack.
 // nil when no pack is installed; lookupEN returns nil in that case and run() falls
 // back to the dictionaryapi.dev network API.
-var enProvider, usingInstalledPack = func() (LookupProvider, bool) {
+var enProvider = func() *installedPack {
 	idxPath := filepath.Join(xdgDataDir(), "en.idx")
 	datPath := filepath.Join(xdgDataDir(), "en.dat")
 	if _, err := os.Stat(idxPath); err == nil {
 		p := &installedPack{idxPath: idxPath, datPath: datPath}
 		go p.init()
-		return p, true
+		return p
 	}
-	return nil, false
+	return nil
 }()
 
 func lookupEN(word string) *LexEntry {
@@ -504,12 +498,8 @@ var packRegistry = func() map[string]*installedPack {
 	return packs
 }()
 
-func packForLang(lang string) *installedPack {
-	return packRegistry[lang]
-}
-
 func lookupLang(word, lang string) *LexEntry {
-	if p := packForLang(lang); p != nil {
+	if p := packRegistry[lang]; p != nil {
 		return p.Lookup(word)
 	}
 	return nil
@@ -954,34 +944,9 @@ func parseWikiHeading(line string) (int, string) {
 	return open, inner
 }
 
-// wiktionarySection fetches the full page wikitext in a single API call and
-// extracts the first section whose heading satisfies match.
-// This avoids the two-round-trip sections-index → wikitext pattern.
-func wiktionarySection(base, word string, match func(string) bool) string {
-	var resp struct {
-		Query struct {
-			Pages map[string]struct {
-				Revisions []struct {
-					Text string `json:"*"`
-				} `json:"revisions"`
-			} `json:"pages"`
-		} `json:"query"`
-	}
-	if err := fetchJSON(base+"?action=query&titles="+url.QueryEscape(word)+"&prop=revisions&rvprop=content&format=json", &resp); err != nil {
-		return ""
-	}
-	var fullText string
-	for _, p := range resp.Query.Pages {
-		if len(p.Revisions) > 0 {
-			fullText = p.Revisions[0].Text
-		}
-	}
-	if fullText == "" {
-		return ""
-	}
-
-	// Walk lines: find the heading that satisfies match, collect until next same/higher heading.
-	// We parse headings manually (count leading/trailing '=') to avoid RE2 backreference limits.
+// extractWikiSection walks pre-fetched wikitext and returns the body of the
+// first section whose heading satisfies match (stops at the next heading).
+func extractWikiSection(fullText string, match func(string) bool) string {
 	lines := strings.Split(fullText, "\n")
 	var result []string
 	inSection := false
@@ -989,7 +954,7 @@ func wiktionarySection(base, word string, match func(string) bool) string {
 		level, heading := parseWikiHeading(line)
 		if level > 0 {
 			if inSection {
-				break // stop at any heading once inside the target section
+				break
 			}
 			if match(heading) {
 				inSection = true
@@ -1001,6 +966,76 @@ func wiktionarySection(base, word string, match func(string) bool) string {
 		}
 	}
 	return strings.Join(result, "\n")
+}
+
+// wikiRedirectLinkRe extracts the redirect target from a wikitext redirect line.
+var wikiRedirectLinkRe = regexp.MustCompile(`\[\[([^\]#|]+)`)
+
+// isWikiRedirect returns the redirect target if the wikitext is a redirect page,
+// or "" if it is a normal content page. Redirect pages have their very first
+// non-empty line starting with "#" followed by [[target]] (all language wikis).
+func isWikiRedirect(text string) string {
+	for _, line := range strings.SplitN(text, "\n", 5) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			return "" // first content line is not a redirect
+		}
+		if m := wikiRedirectLinkRe.FindStringSubmatch(line); m != nil {
+			return strings.TrimSpace(m[1])
+		}
+		return ""
+	}
+	return ""
+}
+
+// fetchFullWikitext retrieves the raw wikitext for a page via the MediaWiki
+// action=query&prop=revisions API. Follows one level of wikitext redirect
+// (#REDIRECT / #WEITERLEITUNG / etc.) automatically. Returns "" on error.
+func fetchFullWikitext(base, word string) string {
+	text := fetchWikitextRaw(base, word)
+	if text == "" {
+		return ""
+	}
+	// Follow one redirect (inflected forms, spelling variants, etc.)
+	if target := isWikiRedirect(text); target != "" && target != word {
+		if t2 := fetchWikitextRaw(base, target); t2 != "" {
+			return t2
+		}
+	}
+	return text
+}
+
+// fetchWikitextRaw is the raw (no redirect-following) wikitext fetcher.
+func fetchWikitextRaw(base, word string) string {
+	var resp struct {
+		Query struct {
+			Pages map[string]struct {
+				Revisions []struct {
+					Text string `json:"*"`
+				} `json:"revisions"`
+			} `json:"pages"`
+		} `json:"query"`
+	}
+	// &redirects tells MediaWiki to follow canonical DB-level redirects automatically.
+	if err := fetchJSON(base+"?action=query&titles="+url.QueryEscape(word)+"&prop=revisions&rvprop=content&redirects&format=json", &resp); err != nil {
+		return ""
+	}
+	for _, p := range resp.Query.Pages {
+		if len(p.Revisions) > 0 {
+			return p.Revisions[0].Text
+		}
+	}
+	return ""
+}
+
+// wiktionarySection fetches the full page wikitext in a single API call and
+// extracts the first section whose heading satisfies match.
+// This avoids the two-round-trip sections-index → wikitext pattern.
+func wiktionarySection(base, word string, match func(string) bool) string {
+	return extractWikiSection(fetchFullWikitext(base, word), match)
 }
 
 // parseGTXSegments concatenates the translated text chunks from raw[0] of a GTX response.
@@ -1021,10 +1056,28 @@ func parseGTXSegments(raw []json.RawMessage) string {
 }
 
 // fetchGTX hits the undocumented Google Translate gtx endpoint.
-func fetchGTX(word, lang string) *Translation {
+// Returns the translation and a boolean indicating HTTP 429 rate-limiting.
+func fetchGTX(word, lang string) (*Translation, bool) {
+	req, err := http.NewRequest("GET", "https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl="+url.QueryEscape(lang)+"&dt=t&dt=bd&q="+url.QueryEscape(word), nil)
+	if err != nil {
+		return nil, false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, true
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false
+	}
 	var raw []json.RawMessage
-	if err := fetchJSON("https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl="+url.QueryEscape(lang)+"&dt=t&dt=bd&q="+url.QueryEscape(word), &raw); err != nil || len(raw) == 0 {
-		return nil
+	if json.Unmarshal(body, &raw) != nil || len(raw) == 0 {
+		return nil, false
 	}
 	translated := parseGTXSegments(raw)
 	detected := "?"
@@ -1032,9 +1085,9 @@ func fetchGTX(word, lang string) *Translation {
 		json.Unmarshal(raw[2], &detected) //nolint
 	}
 	if translated == "" || strings.EqualFold(translated, word) {
-		return nil
+		return nil, false
 	}
-	return &Translation{Word: translated, Detected: detected, Source: "gtx"}
+	return &Translation{Word: translated, Detected: detected, Source: "gtx"}, false
 }
 
 // fetchMyMemory is a documented, stable, no-key fallback (5k chars/day free).
@@ -1064,11 +1117,60 @@ func fetchTranslation(word, lang string) *Translation {
 	if lang == "" || strings.ToLower(lang) == "en" {
 		return nil
 	}
-	if t := fetchGTX(word, lang); t != nil {
-		return t
+	// Race GTX and MyMemory in parallel. Both goroutines always complete because
+	// the channel is buffered(2), avoiding leaks regardless of which path returns.
+	type gtxRes struct {
+		t  *Translation
+		rl bool // true = HTTP 429 rate-limited
 	}
-	return fetchMyMemory(word, lang)
+	gtxCh := make(chan gtxRes, 1)
+	mmCh  := make(chan *Translation, 1)
+	go func() { t, rl := fetchGTX(word, lang); gtxCh <- gtxRes{t, rl} }()
+	go func() { mmCh <- fetchMyMemory(word, lang) }()
+
+	// Wait for the first result that is either a success or a definitive GTX failure.
+	var gtxR gtxRes
+	var mmT  *Translation
+	gtxDone, mmDone := false, false
+	for !gtxDone || !mmDone {
+		select {
+		case gtxR = <-gtxCh:
+			gtxDone = true
+			if gtxR.t != nil {
+				return gtxR.t // GTX succeeded — no need to wait for MyMemory
+			}
+		case mmT = <-mmCh:
+			mmDone = true
+		}
+		// If MyMemory has a result and GTX has already definitively failed (nil,
+		// whether 429 or otherwise), we can return now.
+		if mmDone && mmT != nil && gtxDone {
+			if gtxR.rl {
+				mmT.Source = "mymemory(gtx↯)"
+			}
+			return mmT
+		}
+		// If MyMemory finished but GTX is still in-flight, keep waiting so we
+		// can annotate the rate-limit flag if needed.
+	}
+	// Both done; GTX returned nil.
+	if mmT != nil && gtxR.rl {
+		mmT.Source = "mymemory(gtx↯)"
+	}
+	return mmT
 }
+
+// etymHeadingPat matches the "Etymology" section heading across major Wiktionary languages.
+var etymHeadingPat = regexp.MustCompile(
+	`(?i)(` +
+		`etymology|` + // en
+		`herkunft|wortherkunft|` + // de
+		`[eé]tymologie|` + // fr
+		`[eé]timolog[íi]a|` + // es, pt, it
+		`этимология|этимологія|` + // ru, uk
+		`語源|어원` + // ja, ko
+		`)`,
+)
 
 // synHeadingPat matches the "Synonyms" section heading across major Wiktionary languages.
 // Uses a word-boundary style match (no ^ anchor) since some wikis wrap headings in <span> tags.
@@ -1101,61 +1203,10 @@ func fetchEtymologyWiki(word string) string {
 	return stripWikitext(wt)
 }
 
-// fetchTargetSynonyms fetches synonyms from the target-language Wiktionary.
-// It first tries heading-based extraction (works on en, fr, …); if that yields
-// nothing it falls back to inline-template extraction (de, nl, … embed synonyms
-// as {{Synonyme}}/{{Synoniemen}} inline rather than as a dedicated section).
-func fetchTargetSynonyms(word, lang string) []string {
-	apiBase := "https://" + lang + ".wiktionary.org/w/api.php"
-
-	// Fetch full page wikitext in one request.
-	var resp struct {
-		Query struct {
-			Pages map[string]struct {
-				Revisions []struct {
-					Text string `json:"*"`
-				} `json:"revisions"`
-			} `json:"pages"`
-		} `json:"query"`
-	}
-	if err := fetchJSON(apiBase+"?action=query&titles="+url.QueryEscape(word)+"&prop=revisions&rvprop=content&format=json", &resp); err != nil {
-		return nil
-	}
-	var fullText string
-	for _, p := range resp.Query.Pages {
-		if len(p.Revisions) > 0 {
-			fullText = p.Revisions[0].Text
-		}
-	}
-	if fullText == "" {
-		return nil
-	}
-
+// parseSynsFromWikitext extracts synonym words from pre-fetched wikitext.
+func parseSynsFromWikitext(fullText, lang string) []string {
 	lines := strings.Split(fullText, "\n")
-
-	// Method 1: section-heading extraction (en.wiktionary.org style).
-	wt := func() string {
-		var buf []string
-		inSec := false
-		for _, line := range lines {
-			level, heading := parseWikiHeading(line)
-			if level > 0 {
-				if inSec {
-					break
-				}
-				if synHeadingPat.MatchString(heading) {
-					inSec = true
-				}
-				continue
-			}
-			if inSec {
-				buf = append(buf, line)
-			}
-		}
-		return strings.Join(buf, "\n")
-	}()
-
-	// Method 2: inline template extraction (de.wiktionary.org style — {{Synonyme}}).
+	wt := extractWikiSection(fullText, synHeadingPat.MatchString)
 	if wt == "" {
 		inlineRe := regexp.MustCompile(`(?i)\{\{Synonym`)
 		var buf []string
@@ -1175,15 +1226,11 @@ func fetchTargetSynonyms(word, lang string) []string {
 		}
 		wt = strings.Join(buf, "\n")
 	}
-
 	if wt == "" {
 		return nil
 	}
-
-	// Extract [[word]] or [[word|display]] from wikitext — these are the synonyms.
 	linkRe := regexp.MustCompile(`\[\[(?:[^\]|]+\|)?([^\]|]+)\]\]`)
 	matches := linkRe.FindAllStringSubmatch(wt, -1)
-
 	digitSlashRe := regexp.MustCompile(`[\d/]`)
 	seen := map[string]bool{}
 	var result []string
@@ -1193,8 +1240,6 @@ func fetchTargetSynonyms(word, lang string) []string {
 		if len(runes) < 2 || len(runes) > 30 {
 			continue
 		}
-		// English only: skip uppercase-initial (proper nouns / headings).
-		// Other languages (e.g. German) capitalise all nouns, so we allow them.
 		if lang == "en" && unicode.IsUpper(runes[0]) {
 			continue
 		}
@@ -1212,6 +1257,222 @@ func fetchTargetSynonyms(word, lang string) []string {
 	return result
 }
 
+// fetchTextTranslation machine-translates a multi-line text block via Google GTX.
+// Used only as a last-resort fallback when native target-language content is unavailable.
+func fetchTextTranslation(text, lang string) string {
+	if text == "" || lang == "" || strings.ToLower(lang) == "en" {
+		return ""
+	}
+	var raw []json.RawMessage
+	if err := fetchJSON("https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl="+url.QueryEscape(lang)+"&dt=t&q="+url.QueryEscape(text), &raw); err != nil || len(raw) == 0 {
+		return ""
+	}
+	return parseGTXSegments(raw)
+}
+
+// headingTemplateArgRe extracts the first non-empty argument of a Wiktionary heading
+// template, e.g. {{Wortart|Adjektiv|Deutsch}} → "Adjektiv", {{S|adjectif|fr}} → "adjectif".
+var headingTemplateArgRe = regexp.MustCompile(`\{\{[^|{}]+\|([^|{}]+)`)
+
+// extractHeadingPOS returns the part-of-speech name from a wikitext heading string.
+// Plain-text headings (EN wiki) are returned as-is; template-based headings used by
+// DE, FR, RU, etc. are resolved via their first template argument.
+func extractHeadingPOS(heading string) string {
+	bare := strings.TrimSpace(stripWikitext(heading))
+	if bare != "" {
+		return bare
+	}
+	if m := headingTemplateArgRe.FindStringSubmatch(heading); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+// defnItemRe matches definition list items in Wiktionary wikitext:
+//   - `# text`      — most language wikis (fr, ru, es, it, pt, …)
+//   - `:[1] text`   — German Wiktionary
+//   - `:[[1]] text` — German Wiktionary alternate form
+var defnItemRe = regexp.MustCompile(`^(?:#|:\[+\d+\]+)\s*(.+)`)
+
+// parseDefsFromWikitext extracts native-language Meaning entries from wikitext
+// fetched from a target-language Wiktionary. Groups definition items by the
+// nearest preceding level-3+ heading (used as POS label).
+func parseDefsFromWikitext(fullText string) []Meaning {
+	lines := strings.Split(fullText, "\n")
+	type posGroup struct {
+		pos  string
+		defs []string
+	}
+	var groups []posGroup
+	curPOS := ""
+	for _, line := range lines {
+		level, heading := parseWikiHeading(line)
+		if level > 0 {
+			if level >= 3 {
+				if pos := extractHeadingPOS(heading); pos != "" {
+					curPOS = pos
+				}
+			}
+			continue
+		}
+		// Skip sub-list lines (examples, sub-defs, usage notes).
+		if strings.HasPrefix(line, "##") || strings.HasPrefix(line, "#:") || strings.HasPrefix(line, "#*") {
+			continue
+		}
+		m := defnItemRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		text := strings.TrimSpace(stripWikitext(m[1]))
+		if len([]rune(text)) < 3 {
+			continue
+		}
+		if len(groups) == 0 || groups[len(groups)-1].pos != curPOS {
+			if len(groups) >= 3 {
+				break // cap: at most 3 POS groups
+			}
+			groups = append(groups, posGroup{pos: curPOS})
+		}
+		last := &groups[len(groups)-1]
+		if len(last.defs) < 4 {
+			last.defs = append(last.defs, text)
+		}
+	}
+	var result []Meaning
+	for _, g := range groups {
+		if len(g.defs) == 0 {
+			continue
+		}
+		pos := normalizePOS(g.pos)
+		if pos == "" {
+			pos = "word"
+		}
+		var defs []Def
+		for _, d := range g.defs {
+			defs = append(defs, Def{Text: d})
+		}
+		result = append(result, Meaning{POS: pos, Defs: defs})
+	}
+	return result
+}
+
+// wiktionaryLemma uses the opensearch API to find the canonical/lemma form of
+// a word when the direct page lookup returns nothing (e.g. inflected form with
+// templateArgRe captures up to the first 3 positional arguments of any wikitext
+// template. Named/keyword arguments (containing "=") are excluded by the character
+// class so they don't pollute the positional slots.
+var templateArgRe = regexp.MustCompile(`\{\{[^|{}\n]+\|([^|={}\n\[\]]{2,80})(?:\|([^|={}\n\[\]]{2,80}))?(?:\|([^|={}\n\[\]]{2,80}))?`)
+
+// wikiFlexionLemma extracts the lemma (base form) from an inflection/Flexion page's
+// wikitext without needing to know any template names. It scans the first positional
+// arguments of every template on the page and returns the first candidate C where:
+//
+//   - word starts with C  (inflected form is always longer than its lemma)
+//   - len(C) >= 3         (avoid matching lang codes like "de", "fr")
+//
+// This is language- and template-name-agnostic: works for DE {{Deklinationsseite}},
+// {{inflection of}}, and any other convention where the lemma appears as a positional
+// template argument — which is universal across all major Wiktionary editions.
+// Requires no additional API call since we already hold the wikitext.
+func wikiFlexionLemma(wikitext, word string) string {
+	wLower := strings.ToLower(word)
+	for _, m := range templateArgRe.FindAllStringSubmatch(wikitext, 40) {
+		for _, arg := range m[1:] {
+			arg = strings.TrimSpace(arg)
+			if arg == "" {
+				continue
+			}
+			aLower := strings.ToLower(arg)
+			if aLower == wLower {
+				continue
+			}
+			if strings.HasPrefix(wLower, aLower) && len([]rune(arg)) >= 3 {
+				return arg
+			}
+		}
+	}
+	return ""
+}
+
+// no own article). Returns the first result that is a proper prefix of word
+// (so "einheitlich" is preferred over "einheitliche"), or the first result that
+// differs from word by simple suffix, or "" if nothing useful is found.
+func wiktionaryLemma(base, word string) string {
+	var resp [4]json.RawMessage
+	if err := fetchJSON(base+"?action=opensearch&search="+url.QueryEscape(word)+"&limit=5&namespace=0&format=json", &resp); err != nil {
+		return ""
+	}
+	var titles []string
+	if json.Unmarshal(resp[1], &titles) != nil {
+		return ""
+	}
+	wLower := strings.ToLower(word)
+	for _, t := range titles {
+		tLower := strings.ToLower(t)
+		if tLower == wLower {
+			continue
+		}
+		// Prefer a result that is a base form: word starts with the result
+		// (e.g. word="einheitliche", t="einheitlich").
+		if strings.HasPrefix(wLower, tLower) && len([]rune(t)) >= 3 {
+			return t
+		}
+	}
+	return ""
+}
+
+// wikiResult holds the data fetched from lang.wiktionary.org for a target-language word.
+type wikiResult struct {
+	Meanings    []Meaning
+	Syns        []string
+	Etym        string
+	EtymFromWiki bool // set when etym came from wiki (pack had none); used for debug source label
+}
+
+// fetchTargetWikiData fetches native definitions, synonyms, and etymology for a word
+// from lang.wiktionary.org in a single request.
+// Falls back to an opensearch-based lemma lookup when the direct page is absent OR
+// when the page exists but has no definitions (e.g. de.wiktionary.org Flexion pages
+// for inflected forms like "einheitliche" which contain only conjugation tables).
+func fetchTargetWikiData(word, lang string) wikiResult {
+	apiBase := "https://" + lang + ".wiktionary.org/w/api.php"
+	fullText := fetchFullWikitext(apiBase, word)
+
+	// Pre-check definitions so we know whether to attempt lemma resolution.
+	var wr wikiResult
+	if fullText != "" {
+		wr.Meanings = parseDefsFromWikitext(fullText)
+	}
+
+	// Trigger lemma fallback if the page was absent OR if it yielded no usable
+	// definitions (inflection/Flexion pages exist but contain no def sections).
+	if len(wr.Meanings) == 0 {
+		// 1. Try to read the lemma from the Flexion page wikitext itself — zero
+		//    extra API calls. Covers de.wiktionary.org "Deklinationsseite"/
+		//    "Konjugationsseite" templates and their multilingual equivalents.
+		lemma := wikiFlexionLemma(fullText, word)
+		// 2. Opensearch fallback for cases where the page is absent or uses an
+		//    unknown template style.
+		if lemma == "" {
+			lemma = wiktionaryLemma(apiBase, word)
+		}
+		if lemma != "" {
+			if lemmaText := fetchFullWikitext(apiBase, lemma); lemmaText != "" {
+				fullText = lemmaText
+				wr.Meanings = parseDefsFromWikitext(fullText)
+			}
+		}
+	}
+
+	if fullText == "" {
+		return wikiResult{}
+	}
+	wr.Syns = parseSynsFromWikitext(fullText, lang)
+	wt := extractWikiSection(fullText, etymHeadingPat.MatchString)
+	wr.Etym = strings.TrimSpace(stripWikitext(wt))
+	return wr
+}
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 type RenderInput struct {
@@ -1223,9 +1484,11 @@ type RenderInput struct {
 	SynSource     []string
 	Etym          string
 	Translations  []*Translation
-	SynTargets    [][]string
-	TargetEntries []*LexEntry // native target-language entries (pack or wiktionary)
-	Warnings      []string
+	SynTargets         [][]string
+	TargetEntries      []*LexEntry // native target-language entries (pack or wiktionary)
+	TargetDefnFallback []string    // GTX-translated EN def per lang, used when native source missed
+	TargetEtymFallback []string    // GTX-translated EN etym per lang, used when native source missed
+	Warnings           []string
 	Elapsed       time.Duration
 	FetchLog      []string // per-fetch timing lines
 }
@@ -1292,9 +1555,12 @@ func render(in RenderInput) {
 	// ── definition ────────────────────────────────────────────────────────────
 	defnLang := srcLang
 	var targetMeanings []Meaning
+	hasFallbackDef := len(in.TargetLangs) > 0 && len(in.TargetDefnFallback) > 0 && in.TargetDefnFallback[0] != ""
 	if len(in.TargetEntries) > 0 && in.TargetEntries[0] != nil && len(in.TargetEntries[0].Meanings) > 0 {
 		targetMeanings = in.TargetEntries[0].Meanings
 		defnLang = strings.ToUpper(in.TargetLangs[0])
+	} else if hasFallbackDef {
+		defnLang = strings.ToUpper(in.TargetLangs[0]) + " ~"
 	}
 	fmt.Print(sectionHeader(IDef, "DEFINITION ("+defnLang+")"))
 	if len(targetMeanings) > 0 {
@@ -1309,6 +1575,22 @@ func render(in RenderInput) {
 				if i < len(m.Defs)-1 {
 					fmt.Println()
 				}
+			}
+			fmt.Println()
+		}
+	} else if hasFallbackDef {
+		// No native content — show machine-translated EN text as last resort.
+		for _, para := range strings.Split(in.TargetDefnFallback[0], "\n\n") {
+			para = strings.TrimSpace(para)
+			if para == "" {
+				continue
+			}
+			lines := strings.SplitN(para, "\n", 2)
+			if len(lines) == 2 {
+				fmt.Printf("  %s%s%s\n", CPos+Bold, strings.TrimSuffix(lines[0], ":"), R)
+				fmt.Println(wordWrap(strings.TrimSpace(lines[1]), dividerWidth-4, "  "))
+			} else {
+				fmt.Println(wordWrap(para, dividerWidth-4, "  "))
 			}
 			fmt.Println()
 		}
@@ -1352,11 +1634,7 @@ func render(in RenderInput) {
 	allSyn := dedupe(in.SynSource)
 	if in.Defn != nil {
 		for _, m := range in.Defn.Meanings {
-			for _, s := range m.Syns {
-				if !contains(allSyn, s) {
-					allSyn = append(allSyn, s)
-				}
-			}
+			allSyn = appendUniq(allSyn, m.Syns...)
 		}
 	}
 	if len(allSyn) > 12 {
@@ -1373,6 +1651,9 @@ func render(in RenderInput) {
 	if len(in.TargetEntries) > 0 && in.TargetEntries[0] != nil && in.TargetEntries[0].Etym != "" {
 		etymText = in.TargetEntries[0].Etym
 		etymLang = strings.ToUpper(in.TargetLangs[0])
+	} else if len(in.TargetEtymFallback) > 0 && in.TargetEtymFallback[0] != "" {
+		etymText = in.TargetEtymFallback[0]
+		etymLang = strings.ToUpper(in.TargetLangs[0]) + " ~"
 	}
 	if etymText != "" {
 		fmt.Print(sectionHeader(IEty, "ETYMOLOGY ("+etymLang+")"))
@@ -1387,6 +1668,14 @@ func render(in RenderInput) {
 
 	// ── fine print: absent sections ───────────────────────────────────────────
 	var absent []string
+	// note missing target definition only if both native and GTX fallback failed.
+	for i, lang := range in.TargetLangs {
+		hasTargetDef := i < len(in.TargetEntries) && in.TargetEntries[i] != nil && len(in.TargetEntries[i].Meanings) > 0
+		hasFallback := i < len(in.TargetDefnFallback) && in.TargetDefnFallback[i] != ""
+		if !hasTargetDef && !hasFallback {
+			absent = append(absent, "no definition ("+strings.ToUpper(lang)+")")
+		}
+	}
 	if len(allSyn) == 0 {
 		absent = append(absent, "no synonyms ("+srcLang+")")
 	}
@@ -1491,15 +1780,6 @@ func dedupe(s []string) []string {
 	return out
 }
 
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
 // normalizePOS maps abbreviated and variant POS labels (from kaikki JSONL) to their
 // full English equivalents used by the API, so both sources render identically.
 var posNorm = map[string]string{
@@ -1577,10 +1857,11 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 		tSynTargets   = make([]time.Duration, len(translateLangs))
 		synPackHits   = make([]bool, len(translateLangs))
 		targetEntries = make([]*LexEntry, len(translateLangs))
+		wikiResults   = make([]wikiResult, len(translateLangs)) // per-lang wiki fetch results
 	)
 	var wg2 sync.WaitGroup
 
-	useXDG := !apiOnly && usingInstalledPack
+	useXDG := !apiOnly && enProvider != nil
 
 	var wg1 sync.WaitGroup
 	wg1.Add(len(translateLangs))
@@ -1593,7 +1874,7 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 			defer wg1.Done()
 			tStart := time.Now()
 			tR := time.Now()
-			enTrans := fetchGTX(word, "en")
+			enTrans, _ := fetchGTX(word, "en")
 			tResolve = time.Since(tR)
 			if enTrans != nil {
 				resolveInP1 = true
@@ -1751,15 +2032,48 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 				go func() {
 					defer wg2.Done()
 					t2 := time.Now()
-					if e := lookupLang(wordTrans[i].Word, lang); e != nil {
-						targetEntries[i] = e
-						if len(e.Syns) > 0 {
-							synTargets[i] = e.Syns
+					translated := wordTrans[i].Word
+
+					// Pack lookup: provides IPA, etym, and possibly syns.
+					// For non-EN langs, pack Meanings are English glosses (kaikki
+					// is sourced from en.wiktionary.org) — we overwrite them below.
+					packEntry := lookupLang(translated, lang)
+
+					// For non-EN target langs, fetch native definitions, synonyms, and
+					// etymology from lang.wiktionary.org in one round-trip.
+					var wr wikiResult
+					if lang != "en" {
+						wr = fetchTargetWikiData(translated, lang)
+					}
+
+					// Build synthetic entry.
+					// Priority for each field: XDG pack → lang.wiktionary.org → (GTX~ fires later).
+					synthetic := &LexEntry{}
+					if packEntry != nil {
+						synthetic.IPA = packEntry.IPA
+						synthetic.Etym = packEntry.Etym
+						if len(packEntry.Syns) > 0 {
+							synthetic.Syns = packEntry.Syns
+							synTargets[i] = packEntry.Syns
 							synPackHits[i] = true
 						}
 					}
-					if len(synTargets[i]) == 0 {
-						synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
+					if lang != "en" {
+						synthetic.Meanings = wr.Meanings
+						if synthetic.Etym == "" && wr.Etym != "" {
+							synthetic.Etym = wr.Etym
+							wr.EtymFromWiki = true
+						}
+						if !synPackHits[i] && len(wr.Syns) > 0 {
+							synTargets[i] = wr.Syns
+						}
+					} else if packEntry != nil {
+						synthetic.Meanings = packEntry.Meanings
+					}
+					wikiResults[i] = wr
+
+					if packEntry != nil || len(wr.Meanings) > 0 {
+						targetEntries[i] = synthetic
 					}
 					tSynTargets[i] = time.Since(t2)
 				}()
@@ -1788,11 +2102,11 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	// for that lang, so wordTrans[0] would be nil and Detected would be unavailable).
 	if entry == nil && defn == nil && resolvedEN == "" {
 		tR := time.Now()
-		enTrans := fetchGTX(word, "en")
+		enTrans, _ := fetchGTX(word, "en")
 		tResolve = time.Since(tR)
 		if enTrans != nil {
 			resolvedEN = enTrans.Word
-			if !apiOnly && usingInstalledPack {
+			if !apiOnly && enProvider != nil {
 				tR2 := time.Now()
 				if e := lookupEN(enTrans.Word); e != nil {
 					tResolveXDG = time.Since(tR2)
@@ -1809,7 +2123,7 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 				if d := fetchDefinition(enTrans.Word); d != nil {
 					tResolveDefn = time.Since(tR3)
 					defn = d
-					if !apiOnly && usingInstalledPack {
+					if !apiOnly && enProvider != nil {
 						apiFallback = true
 					}
 				} else {
@@ -1842,22 +2156,74 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	// translation goroutines; wg2 collects them here.
 	wg2.Wait()
 
-	// Remap synTargets and targetEntries to match the (possibly filtered) translateLangs slice.
+	// Remap synTargets, targetEntries, and wikiResults to match the (possibly filtered) translateLangs slice.
 	{
 		mapped := make([][]string, len(validIdx))
 		mappedT := make([]time.Duration, len(validIdx))
 		mappedHits := make([]bool, len(validIdx))
 		mappedEntries := make([]*LexEntry, len(validIdx))
+		mappedWiki := make([]wikiResult, len(validIdx))
 		for j, idx := range validIdx {
 			mapped[j] = synTargets[idx]
 			mappedT[j] = tSynTargets[idx]
 			mappedHits[j] = synPackHits[idx]
 			mappedEntries[j] = targetEntries[idx]
+			mappedWiki[j] = wikiResults[idx]
 		}
 		synTargets = mapped
 		tSynTargets = mappedT
 		synPackHits = mappedHits
 		targetEntries = mappedEntries
+		wikiResults = mappedWiki
+	}
+
+	// GTX fallback: for any target lang where neither wiki nor pack provided native
+	// definitions/etym, machine-translate the EN content as a last resort.
+	n := len(translateLangs)
+	targetDefnFallback := make([]string, n)
+	targetEtymFallback := make([]string, n)
+	tTargetDefnFallback := make([]time.Duration, n)
+	tTargetEtymFallback := make([]time.Duration, n)
+	{
+		defBlock := ""
+		if defn != nil && len(defn.Meanings) > 0 {
+			var parts []string
+			for _, m := range defn.Meanings {
+				var defs []string
+				for _, d := range m.Defs {
+					if len(defs) < 2 {
+						defs = append(defs, "  "+d.Text)
+					}
+				}
+				parts = append(parts, m.POS+":\n"+strings.Join(defs, "\n"))
+			}
+			defBlock = strings.Join(parts, "\n\n")
+		}
+		var wgFallback sync.WaitGroup
+		for i, lang := range translateLangs {
+			i, lang := i, lang
+			needsDef := !(i < len(targetEntries) && targetEntries[i] != nil && len(targetEntries[i].Meanings) > 0)
+			needsEtym := etym != "" && !(i < len(targetEntries) && targetEntries[i] != nil && targetEntries[i].Etym != "")
+			if needsDef && defBlock != "" {
+				wgFallback.Add(1)
+				go func() {
+					defer wgFallback.Done()
+					t := time.Now()
+					targetDefnFallback[i] = fetchTextTranslation(defBlock, lang)
+					tTargetDefnFallback[i] = time.Since(t)
+				}()
+			}
+			if needsEtym {
+				wgFallback.Add(1)
+				go func() {
+					defer wgFallback.Done()
+					t := time.Now()
+					targetEtymFallback[i] = fetchTextTranslation(etym, lang)
+					tTargetEtymFallback[i] = time.Since(t)
+				}()
+			}
+		}
+		wgFallback.Wait()
 	}
 
 	// Clear the "looking up…" line.
@@ -1913,6 +2279,12 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 		for _, d := range tSynTargets {
 			p2Durations = append(p2Durations, d)
 		}
+		for _, d := range tTargetDefnFallback {
+			p2Durations = append(p2Durations, d)
+		}
+		for _, d := range tTargetEtymFallback {
+			p2Durations = append(p2Durations, d)
+		}
 		p2Total := maxDur(p2Durations...)
 
 		var p1, p2 []string
@@ -1959,25 +2331,62 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 			hasEntry := i < len(targetEntries) && targetEntries[i] != nil
 			if hasEntry {
 				e := targetEntries[i]
-				defnSrc := "xdg"
-				if len(e.Meanings) == 0 {
-					defnSrc = "xdg miss"
+				// Definitions: for non-EN targets, source is lang.wiktionary.org (wiki);
+				// for EN targets, source is the EN pack (xdg).
+				var defnSrc string
+				defnMs := tSynTargets[i].Milliseconds()
+				if lang == "en" {
+					defnSrc = "xdg"
+					if len(e.Meanings) == 0 {
+						defnSrc = "xdg miss"
+					}
+				} else {
+					if i < len(wikiResults) && len(wikiResults[i].Meanings) > 0 {
+						defnSrc = "wiki"
+					} else if i < len(targetDefnFallback) && targetDefnFallback[i] != "" {
+						defnSrc = "wiki miss→gtx~"
+						defnMs = tTargetDefnFallback[i].Milliseconds()
+					} else {
+						defnSrc = "wiki miss"
+					}
 				}
-				etymSrc := "xdg"
-				if e.Etym == "" {
+				// Etymology: XDG pack → wiki → gtx~.
+				var etymSrc string
+				etymMs := int64(0)
+				etymFromWiki := i < len(wikiResults) && wikiResults[i].EtymFromWiki
+				if e.Etym != "" && !etymFromWiki {
+					etymSrc = "xdg"
+				} else if etymFromWiki {
+					etymSrc = "wiki"
+				} else if i < len(targetEtymFallback) && targetEtymFallback[i] != "" {
+					etymSrc = "xdg miss→gtx~"
+					etymMs = tTargetEtymFallback[i].Milliseconds()
+				} else {
 					etymSrc = "xdg miss"
 				}
-				p2 = append(p2, row("defn("+lang+")", 0, defnSrc))
-				p2 = append(p2, row("etym("+lang+")", 0, etymSrc))
+				p2 = append(p2, row("defn("+lang+")", defnMs, defnSrc))
+				p2 = append(p2, row("etym("+lang+")", etymMs, etymSrc))
+			} else {
+				// No pack or wiki entry — if GTX fallback ran, still surface it.
+				if i < len(targetDefnFallback) && targetDefnFallback[i] != "" {
+					p2 = append(p2, row("defn("+lang+")", tTargetDefnFallback[i].Milliseconds(), "gtx~"))
+				}
+				if i < len(targetEtymFallback) && targetEtymFallback[i] != "" {
+					p2 = append(p2, row("etym("+lang+")", tTargetEtymFallback[i].Milliseconds(), "gtx~"))
+				}
 			}
 			if tSynTargets[i] > 0 || synPackHits[i] {
 				synSrc := "api"
 				if synPackHits[i] {
 					synSrc = "xdg"
-				} else if hasEntry {
-					synSrc = "xdg miss→api"
+				} else if lang != "en" {
+					// Syns came from wiki fetch (same round-trip as definitions).
+					synSrc = "wiki"
+					if !hasEntry {
+						synSrc = "api" // no pack entry and no wiki entry — pure API
+					}
 				}
-				p2 = append(p2, row("syns("+lang+")", tSynTargets[i].Milliseconds(), synSrc))
+				p2 = append(p2, row("syns("+lang+")", 0, synSrc))
 			}
 		}
 		if len(p1) > 0 || len(pResolve) > 0 {
@@ -2008,9 +2417,11 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 		SynSource:     synSource,
 		Etym:          etym,
 		Translations:  wordTrans,
-		SynTargets:    synTargets,
-		TargetEntries: targetEntries,
-		Warnings:      warnings,
+		SynTargets:         synTargets,
+		TargetEntries:      targetEntries,
+		TargetDefnFallback: targetDefnFallback,
+		TargetEtymFallback: targetEtymFallback,
+		Warnings:           warnings,
 		Elapsed:       time.Since(start),
 		FetchLog:      fetchLog,
 	})
@@ -2090,8 +2501,7 @@ func (p *installProgress) render() {
 	line := fmt.Sprintf("  %s%s%s", desc, bar, suffix)
 	// Hard-clamp to terminal width as a last resort against wrapping.
 	// Strip ANSI codes before measuring so invisible escape bytes don't count.
-	ansiStripRe := regexp.MustCompile(`\033\[[0-9;]*m`)
-	visible := []rune(ansiStripRe.ReplaceAllString(line, ""))
+	visible := []rune(ansiRe.ReplaceAllString(line, ""))
 	if len(visible) > dividerWidth+2 {
 		// Rebuild line truncated to fit: strip then re-add colours is complex,
 		// so just reuse the plain clamped visible text when overflow occurs.

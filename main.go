@@ -2068,16 +2068,12 @@ func buildFetchLog(p debugTimingParams) []string {
 	} else {
 		p1Dur = append(p1Dur, p.tAPI, p.tAPIEtym)
 	}
-	for _, d := range p.tWordTrans {
-		p1Dur = append(p1Dur, d)
-	}
+	p1Dur = append(p1Dur, p.tWordTrans...)
 	p1Total := maxDur(p1Dur...)
 
 	// Phase 2 wall time = max of wg2 goroutines + sequential GTX~ fallback after wg2.
 	var p2Dur []time.Duration
-	for _, d := range p.tSynTargets {
-		p2Dur = append(p2Dur, d)
-	}
+	p2Dur = append(p2Dur, p.tSynTargets...)
 	p2GoroutineTotal := maxDur(p2Dur...)
 	// GTX~ fallbacks run in parallel with each other but sequentially after wg2.
 	// Per-lang cost = defn fallback + etym fallback (they run concurrently per lang

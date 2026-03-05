@@ -109,6 +109,12 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 // stripANSI removes all ANSI escape sequences, returning the bare visible text.
 func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
 
+// clearLine erases the current terminal line and parks the cursor at column 0.
+// Must be called at the start of every function that produces stdout output so
+// that residual content (shell prompt, progress text) does not bleed into the
+// first output line.
+func clearLine() { fmt.Print("\r\033[2K") }
+
 func wordWrap(text string, width int, indent string) string {
 	words := strings.Fields(text)
 	if len(words) == 0 {
@@ -1793,6 +1799,7 @@ func render(in RenderInput) {
 // ── Help ──────────────────────────────────────────────────────────────────────
 
 func printHelp() {
+	clearLine()
 	art := []string{
 		`  ██╗     ███████╗██╗  ██╗██╗███████╗██╗   ██╗`,
 		`  ██║     ██╔════╝╚██╗██╔╝██║██╔════╝╚██╗ ██╔╝`,
@@ -2512,7 +2519,8 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, forceE
 	// col 0 of the spinner line. \033[2K erases that line, then \033[1A moves up
 	// to the blank line the leading \n created. Without the \033[2K the header
 	// would overwrite the spinner text, leaving trailing chars visible (e.g. “ncy…”).
-	fmt.Printf("\r\033[2K\033[1A")
+	clearLine()
+	fmt.Print("\033[1A") // move past the spinner's leading \n
 
 	var fetchLog []string
 	if debug {

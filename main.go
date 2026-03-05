@@ -1423,10 +1423,11 @@ func wiktionaryLemma(base, word string) string {
 
 // wikiResult holds the data fetched from lang.wiktionary.org for a target-language word.
 type wikiResult struct {
-	Meanings    []Meaning
-	Syns        []string
-	Etym        string
-	EtymFromWiki bool // set when etym came from wiki (pack had none); used for debug source label
+	Meanings     []Meaning
+	Syns         []string
+	Etym         string
+	EtymFromWiki bool   // set when etym came from wiki (pack had none); used for debug source label
+	ResolvedWord string // non-empty when a lemma was resolved from the inflected input form
 }
 
 // fetchTargetWikiData fetches native definitions, synonyms, and etymology for a word
@@ -1460,6 +1461,7 @@ func fetchTargetWikiData(word, lang string) wikiResult {
 			if lemmaText := fetchFullWikitext(apiBase, lemma); lemmaText != "" {
 				fullText = lemmaText
 				wr.Meanings = parseDefsFromWikitext(fullText)
+				wr.ResolvedWord = lemma
 			}
 		}
 	}
@@ -2044,6 +2046,11 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 					var wr wikiResult
 					if lang != "en" {
 						wr = fetchTargetWikiData(translated, lang)
+						// If wiki resolved an inflected form to its lemma, retry the
+						// pack lookup with the lemma so XDG syns/etym/IPA aren't lost.
+						if packEntry == nil && wr.ResolvedWord != "" {
+							packEntry = lookupLang(wr.ResolvedWord, lang)
+						}
 					}
 
 					// Build synthetic entry.

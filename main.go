@@ -104,6 +104,12 @@ func fetchJSON(rawURL string, target interface{}) error {
 // Used for text width calculations so Cyrillic/CJK/etc. wrap correctly.
 func runeLen(s string) int { return len([]rune(s)) }
 
+// ansiRe matches ANSI SGR escape sequences (colours, bold, dim, reset, etc.).
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// stripANSI removes all ANSI escape sequences, returning the bare visible text.
+func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
+
 func wordWrap(text string, width int, indent string) string {
 	words := strings.Fields(text)
 	if len(words) == 0 {
@@ -1064,18 +1070,6 @@ func fetchTranslation(word, lang string) *Translation {
 	return fetchMyMemory(word, lang)
 }
 
-// fetchTextTranslation translates a multi-line text block (definition, etymology).
-func fetchTextTranslation(text, lang string) string {
-	if text == "" || lang == "" || strings.ToLower(lang) == "en" {
-		return ""
-	}
-	var raw []json.RawMessage
-	if err := fetchJSON("https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl="+url.QueryEscape(lang)+"&dt=t&q="+url.QueryEscape(text), &raw); err != nil || len(raw) == 0 {
-		return ""
-	}
-	return parseGTXSegments(raw)
-}
-
 // synHeadingPat matches the "Synonyms" section heading across major Wiktionary languages.
 // Uses a word-boundary style match (no ^ anchor) since some wikis wrap headings in <span> tags.
 var synHeadingPat = regexp.MustCompile(
@@ -1221,21 +1215,19 @@ func fetchTargetSynonyms(word, lang string) []string {
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 type RenderInput struct {
-	Word           string
-	ResolvedEN     string // non-empty when input was non-EN and translated to this EN word
-	APIFallback    bool   // true when -o was set but pack had no entry and API was used instead
-	TargetLangs    []string
-	Defn           *Definition
-	SynSource      []string
-	Etym           string
-	Translations   []*Translation
-	SynTargets     [][]string
-	DefnTranslated string
-	EtymTranslated string
-	PrimaryLang    string
-	Warnings       []string
-	Elapsed        time.Duration
-	FetchLog       []string // per-fetch timing lines
+	Word          string
+	ResolvedEN    string // non-empty when input was non-EN and translated to this EN word
+	APIFallback   bool   // true when -o was set but pack had no entry and API was used instead
+	TargetLangs   []string
+	Defn          *Definition
+	SynSource     []string
+	Etym          string
+	Translations  []*Translation
+	SynTargets    [][]string
+	TargetEntries []*LexEntry // native target-language entries (pack or wiktionary)
+	Warnings      []string
+	Elapsed       time.Duration
+	FetchLog      []string // per-fetch timing lines
 }
 
 func render(in RenderInput) {
@@ -1251,11 +1243,6 @@ func render(in RenderInput) {
 		}
 	}
 	srcLang := strings.ToUpper(detected)
-	showingTrans := in.PrimaryLang != "" && (in.DefnTranslated != "" || in.EtymTranslated != "")
-	dispLang := srcLang
-	if showingTrans {
-		dispLang = strings.ToUpper(in.PrimaryLang)
-	}
 	langTag := detected
 	if len(in.TargetLangs) > 0 {
 		uppers := make([]string, len(in.TargetLangs))
@@ -1283,8 +1270,15 @@ func render(in RenderInput) {
 			wordDisplay += Dim + " → " + R + strings.Join(parts, Dim+" · "+R)
 		}
 	}
-	fmt.Printf("  %s  %s%s%s  %s[%s]%s\n",
-		wordDisplay, CEx, phonetic, R, Dim, langTag, R)
+	// Print header; if the full line would exceed dividerWidth, drop [langTag] to the next line
+	// so it left-aligns at the same indent rather than wrapping mid-line.
+	headerW := 2 + runeLen(stripANSI(wordDisplay)) + 2 + runeLen(phonetic) + 2 + 1 + runeLen(langTag) + 1
+	if headerW <= dividerWidth {
+		fmt.Printf("  %s  %s%s%s  %s[%s]%s\n", wordDisplay, CEx, phonetic, R, Dim, langTag, R)
+	} else {
+		fmt.Printf("  %s  %s%s%s\n", wordDisplay, CEx, phonetic, R)
+		fmt.Printf("  %s[%s]%s\n", Dim, langTag, R)
+	}
 	fmt.Println(divider())
 
 	// ── warnings ─────────────────────────────────────────────────────────────
@@ -1296,19 +1290,25 @@ func render(in RenderInput) {
 	}
 
 	// ── definition ────────────────────────────────────────────────────────────
-	fmt.Print(sectionHeader(IDef, "DEFINITION ("+dispLang+")"))
-	if showingTrans && in.DefnTranslated != "" {
-		for _, para := range strings.Split(in.DefnTranslated, "\n\n") {
-			para = strings.TrimSpace(para)
-			if para == "" {
-				continue
-			}
-			lines := strings.SplitN(para, "\n", 2)
-			if len(lines) == 2 {
-				fmt.Printf("  %s%s%s\n", CPos+Bold, strings.TrimSuffix(lines[0], ":"), R)
-				fmt.Println(wordWrap(strings.TrimSpace(lines[1]), dividerWidth-4, "  "))
-			} else {
-				fmt.Println(wordWrap(para, dividerWidth-4, "  "))
+	defnLang := srcLang
+	var targetMeanings []Meaning
+	if len(in.TargetEntries) > 0 && in.TargetEntries[0] != nil && len(in.TargetEntries[0].Meanings) > 0 {
+		targetMeanings = in.TargetEntries[0].Meanings
+		defnLang = strings.ToUpper(in.TargetLangs[0])
+	}
+	fmt.Print(sectionHeader(IDef, "DEFINITION ("+defnLang+")"))
+	if len(targetMeanings) > 0 {
+		for _, m := range targetMeanings {
+			fmt.Printf("  %s%s%s\n", CPos+Bold, m.POS, R)
+			for i, d := range m.Defs {
+				fmt.Println(wordWrap(fmt.Sprintf("%d. %s", i+1, d.Text), dividerWidth-4, "  "))
+				if d.Example != "" {
+					ex := strings.Join(strings.Fields(d.Example), " ")
+					fmt.Printf("%s%s%s\n", CEx, wordWrap("\""+ex+"\"", dividerWidth-4, "  "), R)
+				}
+				if i < len(m.Defs)-1 {
+					fmt.Println()
+				}
 			}
 			fmt.Println()
 		}
@@ -1370,9 +1370,9 @@ func render(in RenderInput) {
 	// ── etymology ─────────────────────────────────────────────────────────────
 	etymText := in.Etym
 	etymLang := srcLang
-	if showingTrans && in.EtymTranslated != "" {
-		etymText = in.EtymTranslated
-		etymLang = dispLang
+	if len(in.TargetEntries) > 0 && in.TargetEntries[0] != nil && in.TargetEntries[0].Etym != "" {
+		etymText = in.TargetEntries[0].Etym
+		etymLang = strings.ToUpper(in.TargetLangs[0])
 	}
 	if etymText != "" {
 		fmt.Print(sectionHeader(IEty, "ETYMOLOGY ("+etymLang+")"))
@@ -1537,7 +1537,7 @@ func normalizePOS(pos string) string {
 
 // ── Orchestration ─────────────────────────────────────────────────────────────
 
-func run(word string, translateLangs []string, debug, apiOnly bool) {
+func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	start := time.Now()
 	fmt.Printf("\n  %slooking up %s%s%s%s…%s\r", CEx, Bold, word, R, CEx, R)
 
@@ -1557,19 +1557,26 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 		tAPIEtym   time.Duration
 	)
 	var (
-		apiDefn     *Definition
-		apiEtym     string
-		resolvedEN  string // set when input is non-EN and routed through an EN translation
-		apiFallback bool   // set when -o pack miss forces an API call
+		apiDefn           *Definition
+		apiEtym           string
+		resolvedEN        string        // set when input is non-EN and routed through an EN translation
+		apiFallback       bool          // set when pack miss forces an API call
+		p1XDGHit          bool          // true only when Phase-1 XDG goroutine itself found the entry
+		resolveInP1       bool          // true when GTX resolve ran inside Phase-1 goroutine
+		tResolve          time.Duration // time for fetchGTX non-EN resolve call
+		tResolveXDG       time.Duration // time for lookupEN(resolvedEN)
+		tResolveDefn      time.Duration // time for fetchDefinition(resolvedEN) fallback
+		tP1GoroutineTotal time.Duration // total wall time of the hintNonEN Phase-1 goroutine
 	)
 
 	// synTargets and wg2 are declared here so trans goroutines can chain
 	// syns lookups immediately after the translation result arrives,
 	// overlapping with defn/etym fetches in Phase 1.
 	var (
-		synTargets  = make([][]string, len(translateLangs))
-		tSynTargets = make([]time.Duration, len(translateLangs))
-		synPackHits = make([]bool, len(translateLangs))
+		synTargets    = make([][]string, len(translateLangs))
+		tSynTargets   = make([]time.Duration, len(translateLangs))
+		synPackHits   = make([]bool, len(translateLangs))
+		targetEntries = make([]*LexEntry, len(translateLangs))
 	)
 	var wg2 sync.WaitGroup
 
@@ -1577,14 +1584,120 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 
 	var wg1 sync.WaitGroup
 	wg1.Add(len(translateLangs))
-	if useXDG {
+	if hintNonEN {
+		// User declared the word is non-EN (e.g. `lexify einheitlich en`).
+		// Resolve via GTX in Phase 1, parallel with any translation goroutines.
+		// Never look up the raw non-EN word in XDG or the definition API.
+		wg1.Add(1)
+		go func() {
+			defer wg1.Done()
+			tStart := time.Now()
+			tR := time.Now()
+			enTrans := fetchGTX(word, "en")
+			tResolve = time.Since(tR)
+			if enTrans != nil {
+				resolveInP1 = true
+				resolvedEN = enTrans.Word
+				if useXDG {
+					tR2 := time.Now()
+					if e := lookupEN(enTrans.Word); e != nil {
+						tResolveXDG = time.Since(tR2)
+						entry = e
+						p1XDGHit = true
+					} else {
+						tResolveXDG = time.Since(tR2)
+						// XDG miss for resolved word: fall back to API.
+						var wgFB sync.WaitGroup
+						wgFB.Add(2)
+						go func() {
+							defer wgFB.Done()
+							tR3 := time.Now()
+							apiDefn = fetchDefinition(enTrans.Word)
+							tResolveDefn = time.Since(tR3)
+							if apiDefn != nil {
+								apiFallback = true
+							}
+						}()
+						go func() {
+							defer wgFB.Done()
+							apiEtym = fetchEtymologyWiki(enTrans.Word)
+						}()
+						wgFB.Wait()
+					}
+				} else {
+					// apiOnly or no pack: query API for the resolved EN word directly.
+					var wgFB sync.WaitGroup
+					wgFB.Add(2)
+					go func() {
+						defer wgFB.Done()
+						tR3 := time.Now()
+						apiDefn = fetchDefinition(enTrans.Word)
+						tResolveDefn = time.Since(tR3)
+					}()
+					go func() {
+						defer wgFB.Done()
+						apiEtym = fetchEtymologyWiki(enTrans.Word)
+					}()
+					wgFB.Wait()
+				}
+			} else {
+				// GTX returned nil — the word is already English; look it up directly.
+				if useXDG {
+					t := time.Now()
+					entry = lookupEN(word)
+					tEmbed = time.Since(t)
+					if entry != nil {
+						p1XDGHit = true
+					} else {
+						var wgFB sync.WaitGroup
+						wgFB.Add(2)
+						go func() {
+							defer wgFB.Done()
+							t2 := time.Now()
+							apiDefn = fetchDefinition(word)
+							tAPI = time.Since(t2)
+							if apiDefn != nil {
+								apiFallback = true
+							}
+						}()
+						go func() {
+							defer wgFB.Done()
+							t2 := time.Now()
+							apiEtym = fetchEtymologyWiki(word)
+							tAPIEtym = time.Since(t2)
+						}()
+						wgFB.Wait()
+					}
+				} else {
+					var wgFB sync.WaitGroup
+					wgFB.Add(2)
+					go func() {
+						defer wgFB.Done()
+						t2 := time.Now()
+						apiDefn = fetchDefinition(word)
+						tAPI = time.Since(t2)
+					}()
+					go func() {
+						defer wgFB.Done()
+						t2 := time.Now()
+						apiEtym = fetchEtymologyWiki(word)
+						tAPIEtym = time.Since(t2)
+					}()
+					wgFB.Wait()
+				}
+			}
+			tP1GoroutineTotal = time.Since(tStart)
+		}()
+	} else if useXDG {
 		wg1.Add(1)
 		go func() {
 			defer wg1.Done()
 			t := time.Now()
 			entry = lookupEN(word)
 			tEmbed = time.Since(t)
-			if entry == nil {
+			if entry != nil {
+				p1XDGHit = true
+			} else {
 				// Pack miss — fall back to API while translations are still in flight.
 				var wgFB sync.WaitGroup
 				wgFB.Add(2)
@@ -1638,10 +1751,14 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 				go func() {
 					defer wg2.Done()
 					t2 := time.Now()
-					if e := lookupLang(wordTrans[i].Word, lang); e != nil && len(e.Syns) > 0 {
-						synTargets[i] = e.Syns
-						synPackHits[i] = true
-					} else {
+					if e := lookupLang(wordTrans[i].Word, lang); e != nil {
+						targetEntries[i] = e
+						if len(e.Syns) > 0 {
+							synTargets[i] = e.Syns
+							synPackHits[i] = true
+						}
+					}
+					if len(synTargets[i]) == 0 {
 						synTargets[i] = fetchTargetSynonyms(wordTrans[i].Word, lang)
 					}
 					tSynTargets[i] = time.Since(t2)
@@ -1669,23 +1786,34 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 	// unconditionally — no detectedSrc guard needed. This also covers the case
 	// where the only target lang is "en" (fetchTranslation short-circuits to nil
 	// for that lang, so wordTrans[0] would be nil and Detected would be unavailable).
-	if entry == nil && defn == nil {
-		if enTrans := fetchGTX(word, "en"); enTrans != nil {
+	if entry == nil && defn == nil && resolvedEN == "" {
+		tR := time.Now()
+		enTrans := fetchGTX(word, "en")
+		tResolve = time.Since(tR)
+		if enTrans != nil {
 			resolvedEN = enTrans.Word
 			if !apiOnly && usingInstalledPack {
+				tR2 := time.Now()
 				if e := lookupEN(enTrans.Word); e != nil {
+					tResolveXDG = time.Since(tR2)
 					entry = e
 					defn = &Definition{Phonetic: e.IPA, Meanings: e.Meanings}
 					synSource = e.Syns
 					etym = e.Etym
+				} else {
+					tResolveXDG = time.Since(tR2)
 				}
 			}
 			if entry == nil {
+				tR3 := time.Now()
 				if d := fetchDefinition(enTrans.Word); d != nil {
+					tResolveDefn = time.Since(tR3)
 					defn = d
 					if !apiOnly && usingInstalledPack {
 						apiFallback = true
 					}
+				} else {
+					tResolveDefn = time.Since(tR3)
 				}
 			}
 		}
@@ -1709,70 +1837,27 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 		wordTrans = validTrans
 	}
 
-	// ── Phase 2: immediately fan out — no second barrier ─────────────────────
-	// Each result spawns its own goroutine as soon as Phase 1 data is ready.
-	primaryLang := ""
-	if len(translateLangs) > 0 {
-		primaryLang = translateLangs[0]
-	}
-
-	// Build definition text block for content translation
-	defBlock := ""
-	if primaryLang != "" && defn != nil && len(defn.Meanings) > 0 {
-		var parts []string
-		for _, m := range defn.Meanings {
-			var defs []string
-			for _, d := range m.Defs {
-				if len(defs) < 2 {
-					defs = append(defs, "  "+d.Text)
-				}
-			}
-			parts = append(parts, m.POS+":\n"+strings.Join(defs, "\n"))
-		}
-		defBlock = strings.Join(parts, "\n\n")
-	}
-
-	var (
-		defnTranslated string
-		etymTranslated string
-		tDefnTrans     time.Duration
-		tEtymTrans     time.Duration
-	)
-
-	// Fire defn/etym text translations — always via API, since pack definitions
-	// for non-EN words are English glosses, not target-language prose.
-	wg2.Add(2)
-	go func() {
-		defer wg2.Done()
-		if primaryLang != "" && defBlock != "" {
-			t := time.Now()
-			defnTranslated = fetchTextTranslation(defBlock, primaryLang)
-			tDefnTrans = time.Since(t)
-		}
-	}()
-	go func() {
-		defer wg2.Done()
-		if primaryLang != "" && etym != "" {
-			t := time.Now()
-			etymTranslated = fetchTextTranslation(etym, primaryLang)
-			tEtymTrans = time.Since(t)
-		}
-	}()
+	// ── Phase 2: wait for target-language goroutines ─────────────────────────
+	// synTargets/targetEntries goroutines were already launched inside Phase-1
+	// translation goroutines; wg2 collects them here.
 	wg2.Wait()
 
-	// Remap synTargets to match the (possibly filtered) translateLangs slice.
+	// Remap synTargets and targetEntries to match the (possibly filtered) translateLangs slice.
 	{
 		mapped := make([][]string, len(validIdx))
 		mappedT := make([]time.Duration, len(validIdx))
 		mappedHits := make([]bool, len(validIdx))
+		mappedEntries := make([]*LexEntry, len(validIdx))
 		for j, idx := range validIdx {
 			mapped[j] = synTargets[idx]
 			mappedT[j] = tSynTargets[idx]
 			mappedHits[j] = synPackHits[idx]
+			mappedEntries[j] = targetEntries[idx]
 		}
 		synTargets = mapped
 		tSynTargets = mappedT
 		synPackHits = mappedHits
+		targetEntries = mappedEntries
 	}
 
 	// Clear the "looking up…" line.
@@ -1807,8 +1892,14 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 
 		// Phase 1 wall time = max of all parallel tasks in wg1.
 		var p1Durations []time.Duration
-		if entry != nil {
+		if hintNonEN {
+			p1Durations = append(p1Durations, tP1GoroutineTotal)
+		} else if useXDG {
 			p1Durations = append(p1Durations, tEmbed)
+			if !p1XDGHit {
+				// Pack miss: inline API fallback also ran inside Phase 1.
+				p1Durations = append(p1Durations, tAPI, tAPIEtym)
+			}
 		} else {
 			p1Durations = append(p1Durations, tAPI, tAPIEtym)
 		}
@@ -1822,20 +1913,9 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 		for _, d := range tSynTargets {
 			p2Durations = append(p2Durations, d)
 		}
-		p2Durations = append(p2Durations, tDefnTrans, tEtymTrans)
 		p2Total := maxDur(p2Durations...)
 
 		var p1, p2 []string
-		if entry != nil {
-			p1 = append(p1, row("xdg(en)", tEmbed.Milliseconds(), ""))
-		} else {
-			p1 = append(p1, row("defn", tAPI.Milliseconds(), "api"))
-			// Only log etym when something was actually returned; a non-zero
-			// duration with empty result just means wiktionary had no section.
-			if etym != "" {
-				p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
-			}
-		}
 		for i, lang := range translateLangs {
 			src := ""
 			if wordTrans[i] != nil {
@@ -1843,26 +1923,74 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 			}
 			p1 = append(p1, row("trans("+lang+")", tWordTrans[i].Milliseconds(), src))
 		}
+		if !resolveInP1 {
+			// Word lookup happened in Phase 1 (or didn't happen yet): show it.
+			if p1XDGHit {
+				p1 = append(p1, row("syns(en)", tEmbed.Milliseconds(), "xdg"))
+			} else if useXDG {
+				// Pack was queried but missed; inline API fallback fired inside the goroutine.
+				p1 = append(p1, row("syns(en)", tEmbed.Milliseconds(), "xdg miss"))
+				if tAPI > 0 {
+					p1 = append(p1, row("defn", tAPI.Milliseconds(), "api"))
+				}
+				if etym != "" && tAPIEtym > 0 {
+					p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
+				}
+			} else {
+				p1 = append(p1, row("defn", tAPI.Milliseconds(), "api"))
+				if etym != "" {
+					p1 = append(p1, row("etym", tAPIEtym.Milliseconds(), "api"))
+				}
+			}
+		}
+
+		// Resolve step: non-EN word routed through GTX → EN then XDG/API.
+		var pResolve []string
+		if tResolve > 0 {
+			pResolve = append(pResolve, row("gtx→en", tResolve.Milliseconds(), "gtx"))
+			if tResolveXDG > 0 {
+				pResolve = append(pResolve, row("syns(en)", tResolveXDG.Milliseconds(), "xdg"))
+			}
+			if tResolveDefn > 0 {
+				pResolve = append(pResolve, row("defn", tResolveDefn.Milliseconds(), "api"))
+			}
+		}
 		for i, lang := range translateLangs {
+			hasEntry := i < len(targetEntries) && targetEntries[i] != nil
+			if hasEntry {
+				e := targetEntries[i]
+				defnSrc := "xdg"
+				if len(e.Meanings) == 0 {
+					defnSrc = "xdg miss"
+				}
+				etymSrc := "xdg"
+				if e.Etym == "" {
+					etymSrc = "xdg miss"
+				}
+				p2 = append(p2, row("defn("+lang+")", 0, defnSrc))
+				p2 = append(p2, row("etym("+lang+")", 0, etymSrc))
+			}
 			if tSynTargets[i] > 0 || synPackHits[i] {
 				synSrc := "api"
 				if synPackHits[i] {
 					synSrc = "xdg"
+				} else if hasEntry {
+					synSrc = "xdg miss→api"
 				}
 				p2 = append(p2, row("syns("+lang+")", tSynTargets[i].Milliseconds(), synSrc))
 			}
 		}
-		if tDefnTrans > 0 {
-			p2 = append(p2, row("defn-trans", tDefnTrans.Milliseconds(), "gtx"))
-		}
-		if tEtymTrans > 0 {
-			p2 = append(p2, row("etym-trans", tEtymTrans.Milliseconds(), "gtx"))
-		}
-
-		if len(p1) > 0 {
+		if len(p1) > 0 || len(pResolve) > 0 {
 			fetchLog = append(fetchLog, "┌"+strings.Repeat("─", 33))
-			fetchLog = append(fetchLog, header("phase 1", p1Total))
-			fetchLog = append(fetchLog, p1...)
+			if len(p1) > 0 {
+				fetchLog = append(fetchLog, header("phase 1", p1Total))
+				fetchLog = append(fetchLog, p1...)
+			}
+			if len(pResolve) > 0 {
+				resolveTotal := tResolve + tResolveXDG + tResolveDefn
+				fetchLog = append(fetchLog, header("resolve", resolveTotal))
+				fetchLog = append(fetchLog, pResolve...)
+			}
 			if len(p2) > 0 {
 				fetchLog = append(fetchLog, header("phase 2", p2Total))
 				fetchLog = append(fetchLog, p2...)
@@ -1872,21 +2000,19 @@ func run(word string, translateLangs []string, debug, apiOnly bool) {
 	}
 
 	render(RenderInput{
-		Word:           word,
-		ResolvedEN:     resolvedEN,
-		APIFallback:    apiFallback,
-		TargetLangs:    translateLangs,
-		Defn:           defn,
-		SynSource:      synSource,
-		Etym:           etym,
-		Translations:   wordTrans,
-		SynTargets:     synTargets,
-		DefnTranslated: defnTranslated,
-		EtymTranslated: etymTranslated,
-		PrimaryLang:    primaryLang,
-		Warnings:       warnings,
-		Elapsed:        time.Since(start),
-		FetchLog:       fetchLog,
+		Word:          word,
+		ResolvedEN:    resolvedEN,
+		APIFallback:   apiFallback,
+		TargetLangs:   translateLangs,
+		Defn:          defn,
+		SynSource:     synSource,
+		Etym:          etym,
+		Translations:  wordTrans,
+		SynTargets:    synTargets,
+		TargetEntries: targetEntries,
+		Warnings:      warnings,
+		Elapsed:       time.Since(start),
+		FetchLog:      fetchLog,
 	})
 }
 
@@ -2280,6 +2406,7 @@ func main() {
 	word := strings.TrimSpace(os.Args[1])
 	debug := false
 	apiOnly := false
+	hintNonEN := false
 	var translateLangs []string
 	for _, a := range os.Args[2:] {
 		if a == "-d" {
@@ -2291,9 +2418,11 @@ func main() {
 			continue
 		}
 		l := strings.ToLower(strings.TrimSpace(a))
-		if l != "en" {
+		if l == "en" {
+			hintNonEN = true
+		} else {
 			translateLangs = append(translateLangs, l)
 		}
 	}
-	run(word, translateLangs, debug, apiOnly)
+	run(word, translateLangs, debug, apiOnly, hintNonEN)
 }

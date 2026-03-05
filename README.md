@@ -2,9 +2,6 @@
 
 CLI tool for English word lookup: definition, synonyms, etymology, and optional translation into other languages. No API keys required.
 
-One external dependency: [progressbar](https://github.com/schollz/progressbar) (used only during pack installation).
-
-
 
 ## Installation
 

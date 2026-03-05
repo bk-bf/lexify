@@ -2027,6 +2027,8 @@ type debugTimingParams struct {
 	// Per-lang timings.
 	tWordTrans          []time.Duration
 	tSynTargets         []time.Duration
+	tPackLookup         []time.Duration
+	tWikiFetch          []time.Duration
 	tTargetDefnFallback []time.Duration
 	tTargetEtymFallback []time.Duration
 	// Per-lang results (for source-label logic).
@@ -2070,18 +2072,21 @@ func buildFetchLog(p debugTimingParams) []string {
 	}
 	p1Total := maxDur(p1Dur...)
 
-	// Phase 2 wall time = max of all parallel tasks in wg2.
+	// Phase 2 wall time = max of wg2 goroutines + sequential GTX~ fallback after wg2.
 	var p2Dur []time.Duration
 	for _, d := range p.tSynTargets {
 		p2Dur = append(p2Dur, d)
 	}
-	for _, d := range p.tTargetDefnFallback {
-		p2Dur = append(p2Dur, d)
+	p2GoroutineTotal := maxDur(p2Dur...)
+	// GTX~ fallbacks run in parallel with each other but sequentially after wg2.
+	// Per-lang cost = defn fallback + etym fallback (they run concurrently per lang
+	// inside wgFallback, so take the max across langs).
+	var p2FallbackDur []time.Duration
+	for i := range p.tTargetDefnFallback {
+		d := maxDur(p.tTargetDefnFallback[i], p.tTargetEtymFallback[i])
+		p2FallbackDur = append(p2FallbackDur, d)
 	}
-	for _, d := range p.tTargetEtymFallback {
-		p2Dur = append(p2Dur, d)
-	}
-	p2Total := maxDur(p2Dur...)
+	p2Total := p2GoroutineTotal + maxDur(p2FallbackDur...)
 
 	// ── Phase 1 rows ─────────────────────────────────────────────────────────
 	tl.section("phase 1", p1Total)
@@ -2130,9 +2135,12 @@ func buildFetchLog(p debugTimingParams) []string {
 		hasEntry := i < len(p.targetEntries) && p.targetEntries[i] != nil
 		if hasEntry {
 			e := p.targetEntries[i]
-			// Definition source label.
+			// Definition source label and timing.
 			var defnSrc string
 			defnMs := p.tSynTargets[i].Milliseconds()
+			if i < len(p.tPackLookup) && p.tPackLookup[i] > 0 {
+				defnMs = p.tPackLookup[i].Milliseconds()
+			}
 			if lang == "en" {
 				defnSrc = "xdg"
 				if len(e.Meanings) == 0 {
@@ -2140,10 +2148,13 @@ func buildFetchLog(p debugTimingParams) []string {
 				}
 			} else {
 				hasWikiMeanings := i < len(p.wikiResults) && len(p.wikiResults[i].Meanings) > 0
-				if hasWikiMeanings {
+				if isNativeLangPack(lang) && len(e.Meanings) > 0 {
+					// native pack meanings always take priority over wiki
+					defnSrc = "xdg"
+				} else if hasWikiMeanings {
 					defnSrc = "wiki"
 				} else if len(e.Meanings) > 0 {
-					// wiki was skipped — meanings came from native pack
+					// wiki was skipped or missed — meanings came from pack
 					defnSrc = "xdg"
 				} else if i < len(p.targetDefnFallback) && p.targetDefnFallback[i] != "" {
 					defnSrc = "wiki miss→gtx~"
@@ -2152,27 +2163,37 @@ func buildFetchLog(p debugTimingParams) []string {
 					defnSrc = "wiki miss"
 				}
 			}
-			// Etymology source label.
+			// Etymology source label and timing.
+			// tWikiFetch covers the wiki round-trip (triggered when pack had no
+			// etym). tTargetEtymFallback covers the GTX~ call that runs after
+			// wg2 when wiki also missed. Both costs are attributed to etym since
+			// the missing etym triggered the wiki call in the first place.
 			var etymSrc string
+			wikiMs := int64(0)
+			if i < len(p.tWikiFetch) && p.tWikiFetch[i] > 0 {
+				wikiMs = p.tWikiFetch[i].Milliseconds()
+			}
 			etymMs := int64(0)
 			etymFromWiki := i < len(p.wikiResults) && p.wikiResults[i].EtymFromWiki
 			if e.Etym != "" && !etymFromWiki {
 				etymSrc = "xdg"
 			} else if etymFromWiki {
 				etymSrc = "wiki"
+				etymMs = wikiMs
 			} else if i < len(p.targetEtymFallback) && p.targetEtymFallback[i] != "" {
 				if lang == "en" {
 					etymSrc = "xdg miss→gtx~"
 				} else {
 					etymSrc = "wiki miss→gtx~"
 				}
-				etymMs = p.tTargetEtymFallback[i].Milliseconds()
+				etymMs = wikiMs + p.tTargetEtymFallback[i].Milliseconds()
 			} else {
 				if lang == "en" {
 					etymSrc = "xdg miss"
 				} else {
 					etymSrc = "wiki miss"
 				}
+				etymMs = wikiMs
 			}
 			tl.add("defn("+lang+")", defnMs, defnSrc)
 			tl.add("etym("+lang+")", etymMs, etymSrc)
@@ -2224,6 +2245,8 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	var (
 		synTargets    = make([][]string, len(translateLangs))
 		tSynTargets   = make([]time.Duration, len(translateLangs))
+		tPackLookup   = make([]time.Duration, len(translateLangs))
+		tWikiFetch    = make([]time.Duration, len(translateLangs))
 		synPackHits   = make([]bool, len(translateLangs))
 		targetEntries = make([]*LexEntry, len(translateLangs))
 		wikiResults   = make([]wikiResult, len(translateLangs))
@@ -2260,7 +2283,9 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 
 					// Pack lookup: provides IPA, syns, etym, and (for native-edition
 					// packs) target-language definitions and etymology.
+					tPack := time.Now()
 					packEntry := lookupLang(translated, lang)
+					tPackLookup[i] = time.Since(tPack)
 
 					// For non-EN target langs, fetch native definitions, synonyms, and
 					// etymology from lang.wiktionary.org — but only when the pack does
@@ -2272,9 +2297,12 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 					if lang != "en" {
 						needsWiki := !isNativeLangPack(lang) ||
 							packEntry == nil ||
-							len(packEntry.Meanings) == 0
+							len(packEntry.Meanings) == 0 ||
+							packEntry.Etym == ""
 						if needsWiki {
+							tWiki := time.Now()
 							wr = fetchTargetWikiData(translated, lang)
+							tWikiFetch[i] = time.Since(tWiki)
 							// If wiki resolved an inflected form to its lemma, retry the
 							// pack lookup with the lemma so XDG syns/etym/IPA aren't lost.
 							if packEntry == nil && wr.ResolvedWord != "" {
@@ -2301,9 +2329,14 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 						}
 					}
 					if lang != "en" {
-						// Prefer wiki meanings (richer content) when available; fall back
-						// to pack meanings (native-edition packs have target-lang glosses).
-						if len(wr.Meanings) > 0 {
+						// For native-edition packs, pack meanings take priority: they are
+						// sourced from the native Wiktionary and include examples, multiple
+						// senses, etc. Wiki meanings are only used when the pack has none.
+						// For non-native packs, wiki meanings are preferred (pack glosses
+						// are in English, which is useless for target-lang display).
+						if isNativeLangPack(lang) && packEntry != nil && len(packEntry.Meanings) > 0 {
+							synthetic.Meanings = packEntry.Meanings
+						} else if len(wr.Meanings) > 0 {
 							synthetic.Meanings = wr.Meanings
 						} else if packEntry != nil {
 							synthetic.Meanings = packEntry.Meanings
@@ -2416,21 +2449,27 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 	{
 		mapped := make([][]string, len(validIdx))
 		mappedT := make([]time.Duration, len(validIdx))
+		mappedPack := make([]time.Duration, len(validIdx))
+		mappedWiki := make([]time.Duration, len(validIdx))
 		mappedHits := make([]bool, len(validIdx))
 		mappedEntries := make([]*LexEntry, len(validIdx))
-		mappedWiki := make([]wikiResult, len(validIdx))
+		mappedWikiRes := make([]wikiResult, len(validIdx))
 		for j, idx := range validIdx {
 			mapped[j] = synTargets[idx]
 			mappedT[j] = tSynTargets[idx]
+			mappedPack[j] = tPackLookup[idx]
+			mappedWiki[j] = tWikiFetch[idx]
 			mappedHits[j] = synPackHits[idx]
 			mappedEntries[j] = targetEntries[idx]
-			mappedWiki[j] = wikiResults[idx]
+			mappedWikiRes[j] = wikiResults[idx]
 		}
 		synTargets = mapped
 		tSynTargets = mappedT
+		tPackLookup = mappedPack
+		tWikiFetch = mappedWiki
 		synPackHits = mappedHits
 		targetEntries = mappedEntries
-		wikiResults = mappedWiki
+		wikiResults = mappedWikiRes
 	}
 
 	// GTX fallback: for any target lang where neither wiki nor pack provided native
@@ -2505,6 +2544,8 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 			tP1GoroutineTotal:   rs.tP1Total,
 			tWordTrans:          tWordTrans,
 			tSynTargets:         tSynTargets,
+			tPackLookup:         tPackLookup,
+			tWikiFetch:          tWikiFetch,
 			tTargetDefnFallback: tTargetDefnFallback,
 			tTargetEtymFallback: tTargetEtymFallback,
 			translateLangs:      translateLangs,

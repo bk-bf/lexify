@@ -2560,6 +2560,10 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXE
 		})
 	}
 
+	etymForRender := etym
+	if noGTXEty {
+		etymForRender = ""
+	}
 	render(RenderInput{
 		Word:               word,
 		ResolvedEN:         rs.resolvedEN,
@@ -2567,7 +2571,7 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN, noGTXE
 		TargetLangs:        translateLangs,
 		Defn:               defn,
 		SynSource:          synSource,
-		Etym:               etym,
+		Etym:               etymForRender,
 		Translations:       wordTrans,
 		SynTargets:         synTargets,
 		TargetEntries:      targetEntries,

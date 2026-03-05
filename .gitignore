@@ -7,3 +7,4 @@ data/
 lexify
 
 docs/private/
+.nvim.lua

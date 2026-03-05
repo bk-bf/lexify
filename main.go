@@ -2108,6 +2108,18 @@ func run(word string, translateLangs []string, debug, apiOnly, hintNonEN bool) {
 						// Gating on minEtymRunes discards those stubs and leaves
 						// synthetic.Etym empty, which causes needsEtym=true and the
 						// GTX~ fallback to fire in the next pass.
+						//
+						// TODO: find a proper XDG/API source for target-language
+						// etymology. Options worth evaluating:
+						//   - kaikki.org packs include etymology_text from
+						//     en.wiktionary.org, but the text is English; a
+						//     target-lang kaikki dump would solve this cleanly.
+						//   - MediaWiki action=parse&prop=text returns fully-rendered
+						//     HTML for a section (including transclusions), which
+						//     would give us the real etymology string without a
+						//     second lookup — at the cost of HTML stripping on top.
+						//   - Wikidata etymological properties (P5191 "derived from")
+						//     are structured but sparse and require an extra query.
 						if runeLen(wr.Etym) >= minEtymRunes {
 							synthetic.Etym = wr.Etym
 							wr.EtymFromWiki = true

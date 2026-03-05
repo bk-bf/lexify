@@ -41,7 +41,7 @@ lexify <word> <lang> [lang ...]
 | `--force`        | Reinstall even if pack is already up to date                             |
 | `-o`             | Force live API (skip installed pack)                                     |
 | `-d`             | Show per-fetch debug timing                                              |
-| `--no-gtx-ety`   | Skip GTX etymology fallback (leave blank when pack/wiki miss)            |
+| `--force-ety`    | Use GTX~ as etymology fallback when pack/wiki miss                       |
 
 Pass any BCP-47 language code as `<lang>`:
 `fr` `ru` `de` `es` `it` `pt` `ja` `zh` `ko` `ar` `nl` `pl` `sv` `tr` `uk` `hi` …
